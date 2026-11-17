@@ -30,6 +30,24 @@ jobs:
             python3 python3-pip \
             rsync
 
+            
+      
+      - name: Configure LLVM tools
+        run: |
+          sudo ln -sf /usr/bin/clang-15 /usr/local/bin/clang
+          sudo ln -sf /usr/bin/ld.lld-15 /usr/local/bin/ld.lld
+
+          for tool in ar nm objcopy objdump readelf strip ranlib; do
+            sudo ln -sf /usr/bin/llvm-${tool}-15 /usr/local/bin/llvm-${tool}
+          done
+
+          clang --version
+          ld.lld --version
+          llvm-ar --version
+          llvm-nm --version
+
+          
+
       - name: Check toolchain
         run: |
           clang-15 --version
