@@ -1927,6 +1927,10 @@ static int __do_execve_file(int fd, struct filename *filename,
 	rseq_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_post_execveat(&fd, &filename, &argv, &envp,
+				 &flags, &retval);
+	#endif
 	free_bprm(bprm);
 	kfree(pathbuf);
 	if (filename)
