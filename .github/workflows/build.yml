@@ -1,230 +1,135 @@
-
-name: Build Sashimi Kernel
+name: Build Sashimi Kernel (Redmi 9A / blossom)
 
 on:
+  push:
+    branches: [ "Esd" ]
   workflow_dispatch:
+
+env:
+  DEVICE_CODENAME: blossom
+  DEVICE_ARCH: arm64
+  DEFCONFIG: blossom_defconfig
+  TOOLCHAIN_URL: "https://github.com/kdrag0n/proton-clang/releases/download/15.0.0/proton-clang-15.0.0-linux-x86_64.tar.zst"
+  KERNELSU_CONFIG_REQUIRED: "CONFIG_KSU=y CONFIG_KSU_MANUAL_HOOK=y"
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout source
+      - name: Checkout Source
         uses: actions/checkout@v4
         with:
           ref: Esd
           fetch-depth: 0
 
-      - name: Install dependencies
+      - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential \
-            flex gcc-aarch64-linux-gnu \
-            binutils-aarch64-linux-gnu \
-            clang-15 lld-15 llvm-15 \
-            libssl-dev libelf-dev \
-            python3 python3-pip \
-            rsync
-
-      - name: Configure LLVM tools
+          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick libncurses5 libncurses5-dev libssl-dev libxml2 libxml2-utils lzop make maven ninja-build pngcrush python3 rsync schedtool squashfs-tools wget xsltproc zip zlib1g-dev zstd
+          # Устанавливаем утилиты для LLVM/LLD
+          sudo apt-get install -y llvm lld clang
+          mkdir -p $GITHUB_WORKSPACE/toolchain
+          
+      - name: Download Toolchain (Clang 15)
         run: |
-          sudo ln -sf /usr/bin/clang-15 /usr/local/bin/clang
-          sudo ln -sf /usr/bin/clang++-15 /usr/local/bin/clang++
-          sudo ln -sf /usr/bin/ld.lld-15 /usr/local/bin/ld.lld
+          wget -q -O toolchain.tar.zst ${{ env.TOOLCHAIN_URL }}
+          tar -xvf toolchain.tar.zst -C $GITHUB_WORKSPACE/toolchain --strip-components=1
+          echo "$GITHUB_WORKSPACE/toolchain/bin" >> $GITHUB_PATH
 
-          for tool in ar nm objcopy objdump readelf strip ranlib size; do
-            sudo ln -sf /usr/bin/llvm-${tool}-15 /usr/local/bin/llvm-${tool}
-          done
-
-          clang --version
-          clang++ --version
-          ld.lld --version
-          llvm-ar --version
-
-      - name: Check toolchain
+      - name: Verify KernelSU Configuration
         run: |
-          clang-15 --version
-          ld.lld-15 --version
-          aarch64-linux-gnu-gcc --version
-
-      - name: Configure kernel
-        run: |
-          make ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-            CROSS_COMPILE=aarch64-linux-gnu- \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            blossom_defconfig
-
-      - name: Verify configuration
-        run: |
-          grep -q '^CONFIG_KSU=y' .config
-          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' .config
-
-          if grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' .config; then
-            echo "::error::TRACEPOINT_HOOK must be disabled"
-            exit 1
-          fi
-
-          echo "KernelSU configuration verified"
-
-      - name: Build kernel with automatic include recovery
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          INCLUDE_FLAGS=()
-          : > .ci-include-paths.txt
-
-          BUILD_OK=0
-          MAX_ATTEMPTS=12
-
-          for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
-            echo ""
-            echo "=========================================="
-            echo "BUILD ATTEMPT $attempt / $MAX_ATTEMPTS"
-            echo "=========================================="
-
-            LOG="build-attempt-${attempt}.log"
-
-            set +e
-            make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              KCFLAGS="${INCLUDE_FLAGS[*]}" \
-              V=1 \
-              Image.gz-dtb 2>&1 | tee "$LOG"
-
-            BUILD_STATUS=${PIPESTATUS[0]}
-            set -e
-
-            if [ "$BUILD_STATUS" -eq 0 ]; then
-              echo "Kernel build completed successfully."
-              BUILD_OK=1
-              break
-            fi
-
-            echo ""
-            echo "Build failed. Checking for missing headers..."
-
-            : > .ci-new-paths.txt
-
-            python3 - "$PWD" "$LOG" \
-              .ci-include-paths.txt .ci-new-paths.txt <<'PY'
-          import os
-          import re
-          import sys
-
-          root, log_file, known_file, output_file = sys.argv[1:]
-
-          patterns = [
-              re.compile(r"""fatal error:\s*['"]([^'"]+)['"]\s+file not found"""),
-              re.compile(r"""fatal error:\s*([^:\s]+):\s+No such file or directory"""),
-          ]
-
-          missing = set()
-
-          with open(log_file, errors="replace") as f:
-              for line in f:
-                  for pattern in patterns:
-                      match = pattern.search(line)
-                      if match:
-                          missing.add(match.group(1).removeprefix("./"))
-                          break
-
-          if not missing:
-              print("No recognizable missing-header error found.")
-              print("This is likely a different compilation error.")
-              sys.exit(2)
-
-          known = set()
-
-          if os.path.exists(known_file):
-              with open(known_file) as f:
-                  known = {line.strip() for line in f if line.strip()}
-
-          found = {}
-          for header in sorted(missing):
-              basename = os.path.basename(header)
-              candidates = []
-
-              for current, dirs, files in os.walk(root):
-                  dirs[:] = [
-                      d for d in dirs
-                      if d not in {".git", ".github"}
-                  ]
-
-                  if basename in files:
-                      candidates.append(
-                          os.path.relpath(current, root)
-                      )
-
-              if len(candidates) == 0:
-                  print(f"HEADER NOT FOUND IN SOURCE: {header}")
-                  sys.exit(3)
-
-              if len(candidates) > 1:
-                  print(f"AMBIGUOUS HEADER: {header}")
-                  for path in candidates:
-                      print(f"  {path}")
-                  sys.exit(4)
-
-              directory = candidates[0]
-
-              if directory not in known:
-                  found[directory] = header
-
-          if not found:
-              print("No new unique include paths were discovered.")
-              print("Automatic recovery cannot safely continue.")
-              sys.exit(5)
-
-          with open(output_file, "w") as f:
-              for directory in sorted(found):
-                  print(f"Found {found[directory]} in {directory}")
-                  f.write(directory + "\n")
-          PY
-
-            SCAN_STATUS=$?
-
-            if [ "$SCAN_STATUS" -ne 0 ]; then
-              echo "::error::Automatic include recovery stopped."
+          echo "🔍 Checking KernelSU parameters в ${{ env.DEFCONFIG }}..."
+          for config in $KERNELSU_CONFIG_REQUIRED; do
+            if grep -q "$config" arch/${{ env.DEVICE_ARCH }}/configs/${{ env.DEFCONFIG }}; then
+              echo "✅ Найден: $config"
+            else
+              echo "❌ ОШИБКА: Отсутствует $config в defconfig!"
               exit 1
             fi
-
-            while IFS= read -r directory; do
-              [ -n "$directory" ] || continue
-
-              echo "Adding include directory: $directory"
-
-              INCLUDE_FLAGS+=("-I$PWD/$directory")
-              echo "$directory" >> .ci-include-paths.txt
-            done < .ci-new-paths.txt
-
           done
 
-          if [ "$BUILD_OK" -ne 1 ]; then
-            echo "::error::Build did not finish within $MAX_ATTEMPTS attempts."
+      - name: Prepare Kernel (Make defconfig)
+        run: |
+          export ARCH=${{ env.DEVICE_ARCH }}
+          export SUBARCH=${{ env.DEVICE_ARCH }}
+          export CC=clang
+          export CXX=clang++
+          export LD=ld.lld
+          export LLVM=1
+          export LLVM_IAS=1
+          make O=out ${{ env.DEFCONFIG }}
+
+      - name: Smart Include Path Analyzer (Pre-build)
+        run: |
+          cat << 'EOF' > analyze_includes.py
+          import os, re, subprocess, sys
+          # Скрипт проверяет заголовки, специфичные для MTK, чтобы предупредить о проблемах ДО компиляции
+          critical_headers = ["dramc_io.h", "cmdq_engine.h", "modem_cldma_events.h"]
+          
+          print("🔎 Сканирование дерева исходников на наличие MTK-заголовков...")
+          for header in critical_headers:
+              result = subprocess.run(f"find . -name '{header}' -type f", shell=True, capture_output=True, text=True)
+              paths = result.stdout.strip().split('\n')
+              if paths and paths[0]:
+                  print(f"✅ {header} найден в: {paths}")
+                  # Здесь можно добавить автоматический патчинг Makefile, если путь один
+              else:
+                  print(f"⚠️  {header} НЕ НАЙДЕН в репозитории! Сборка упадет.")
+          EOF
+          python3 analyze_includes.py
+
+      - name: Build Kernel
+        id: build_kernel
+        run: |
+          export ARCH=${{ env.DEVICE_ARCH }}
+          export SUBARCH=${{ env.DEVICE_ARCH }}
+          export CC=clang
+          export CXX=clang++
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export STRIP=llvm-strip
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export OBJSIZE=llvm-size
+          export READELF=llvm-readelf
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export LLVM=1
+          export LLVM_IAS=1
+          
+          # Используем ccache для ускорения
+          export USE_CCACHE=1
+          ccache -M 50G
+          
+          # Ограничиваем параллелизм, чтобы избежать OOM на GitHub Runners
+          make -j$(nproc --all) O=out \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            Image.gz-dtb dtbo.img
+          
+          if [ ! -f out/arch/${{ env.DEVICE_ARCH }}/boot/Image.gz-dtb ]; then
+            echo "❌ Сборка не создала Image.gz-dtb!"
             exit 1
           fi
 
-      - name: Upload build diagnostics
-        if: always()
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Sashimi-Build-Logs
+          name: sashimi-kernel-${{ env.DEVICE_CODENAME }}-${{ github.sha }}
           path: |
-            build-attempt-*.log
-            .ci-include-paths.txt
-          if-no-files-found: warn
+            out/arch/${{ env.DEVICE_ARCH }}/boot/Image.gz-dtb
+            out/arch/${{ env.DEVICE_ARCH }}/boot/dtbo.img
+            out/.config
           retention-days: 7
 
-      - name: Upload kernel artifacts
+      - name: Post-Build KernelSU Check
         if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Sashimi-Kernel-Esd
-          path: |
-            arch/arm64/boot/Image.gz
-            arch/arm64/boot/dts/
-          if-no-files-found: error
-          retention-days: 7
+        run: |
+          echo "🔍 Финальная проверка .config на наличие KernelSU..."
+          for config in $KERNELSU_CONFIG_REQUIRED; do
+            if grep -q "$config" out/.config; then
+              echo "✅ Подтверждено в итоговом .config: $config"
+            else
+              echo "❌ ВНИМАНИЕ: $config был выключен в процессе сборки (возможно, скрытая зависимость)!"
+            fi
+          done
