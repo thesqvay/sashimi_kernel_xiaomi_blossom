@@ -50,7 +50,6 @@ jobs:
 
       - name: Build Kernel
         run: |
-          # Гибридный PATH: Clang главный, GCC подхватывается, когда Makefile MTK требует легаси
           export PATH="/tmp/clang/bin:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
 
           export ARCH=${KERNEL_ARCH}
@@ -70,9 +69,9 @@ jobs:
           fi
 
           echo "🚀 Начало компиляции ядра..."
-          # ВАЖНО: Мы НЕ указываем 'dtbo.img' или 'Image.gz-dtb' явно. 
-          # Мы запускаем make без целей, чтобы сработал дефолтный таргет 'all' из Makefile MTK, 
-          # который сам корректно соберет Image.gz-dtb и проигнорирует отсутствующий dtbo.img.
+          # KCFLAGS="-Wno-unknown-warning-option" заставляет Clang игнорировать 
+          # специфичные для GCC флаги из Makefile'ов драйверов (GPU, Wi-Fi и т.д.).
+          # Это НЕ скрывает настоящие ошибки C-кода, а лишь убирает ругань на незнакомые флаги.
           make -j$(nproc) \
             O=out \
             ARCH=${ARCH} \
@@ -80,6 +79,7 @@ jobs:
             CLANG_TRIPLE=${CLANG_TRIPLE} \
             CROSS_COMPILE=${CROSS_COMPILE} \
             CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
+            KCFLAGS="-Wno-unknown-warning-option" \
             2>&1 | tee build.log
 
       - name: Verify Output
