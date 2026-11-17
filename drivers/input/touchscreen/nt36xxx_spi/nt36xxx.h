@@ -110,7 +110,7 @@ extern const uint16_t gesture_key_array[];
 #define BOOT_UPDATE_XNL_FIRMWARE_NAME     "novatek_ts_djn_fw.bin"
 
 //---ESD Protect.---
-#define NVT_TOUCH_ESD_PROTECT 0
+#define NVT_TOUCH_ESD_PROTECT 1
 #define NVT_TOUCH_ESD_CHECK_PERIOD 1500	/* ms */
 #define NVT_TOUCH_WDT_RECOVERY 1
 
