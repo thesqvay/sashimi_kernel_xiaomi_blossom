@@ -1,0 +1,66 @@
+
+name: Build Esd
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: Esd
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential flex \
+            libssl-dev libelf-dev \
+            python3 python-is-python3 \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            clang-15 lld-15 llvm-15 \
+            ccache
+
+      - name: Check compiler
+        run: |
+          clang-15 --version
+          ld.lld-15 --version
+
+      - name: Configure
+        run: |
+          make ARCH=arm64 LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang-15 \
+            LD=ld.lld-15 \
+            blossom_defconfig
+
+      - name: Verify configuration
+        run: |
+          grep -E 'CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK' .config
+          grep -E 'CONFIG_KSU_MANUAL_HOOK_AUTO' .config || true
+
+      - name: Build kernel
+        run: |
+          make -j$(nproc) ARCH=arm64 \
+            LLVM=1 LLVM_IAS=1 \
+            CC=clang-15 LD=ld.lld-15 \
+            Image.gz-dtb dtbs
+
+      - name: Upload kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sashimi-Redmi9A-Image
+          path: |
+            arch/arm64/boot/Image.gz
+            arch/arm64/boot/Image.gz-dtb
+            arch/arm64/boot/dts/**/*.dtb
+          if-no-files-found: error
+          retention-days: 7
+          
