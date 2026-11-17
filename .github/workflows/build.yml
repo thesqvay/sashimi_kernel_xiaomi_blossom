@@ -1,4 +1,4 @@
-name: Build MTK Kernel (blossom)
+name: Build Sashimi Kernel (blossom)
 
 on:
   workflow_dispatch:
@@ -11,7 +11,7 @@ env:
 
 jobs:
   build:
-    # СТРОГО 22.04! На 24.04+ нет нужных пакетов libncurses5-dev
+    # СТРОГО 22.04! На 24.04+ нет пакета libncurses5-dev, который требуют скрипты MTK
     runs-on: ubuntu-22.04 
 
     steps:
@@ -22,8 +22,9 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
+          # Добавляем python-is-python3, так как скрипты MTK (DrvGen.py) часто вызывают 'python', а не 'python3'
           sudo apt-get install -y bc bison flex build-essential libssl-dev libelf-dev cpio kmod git zip curl ca-certificates jq \
-            wget libffi-dev zlib1g-dev libreadline-dev libsqlite3-dev libbz2-dev libncurses5-dev libgdbm-dev liblzma-dev tk-dev
+            wget libffi-dev zlib1g-dev libreadline-dev libsqlite3-dev libbz2-dev libncurses5-dev libgdbm-dev liblzma-dev tk-dev python3 python-is-python3
 
       - name: Configure git
         run: |
@@ -32,13 +33,13 @@ jobs:
 
       - name: Clone Toolchains (crDroid Clang + LineageOS GCC)
         run: |
-          echo "Cloning crdroid Clang..."
+          echo "Cloning crdroid Clang (AOSP compatible)..."
           git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r428724.git /tmp/clang
 
-          echo "Cloning GCC ARM64..."
+          echo "Cloning GCC ARM64 (для легаси MTK)..."
           GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git /tmp/gcc-aarch64
 
-          echo "Cloning GCC ARM32..."
+          echo "Cloning GCC ARM32 (для 32-битных бинарников в ядре)..."
           GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git /tmp/gcc-arm
 
       - name: Verify Toolchains
@@ -47,19 +48,9 @@ jobs:
           /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version
           /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version
 
-      - name: Clean stale KernelSU placeholder
-        run: |
-          rm -rf KernelSU
-          rm -f drivers/kernelsu
-          echo "Done."
-
-      - name: Integrate KernelSU (NadekoSU fork for MTK)
-        run: |
-          # Используем проверенный скрипт для blossom, адаптированный под старые ядра
-          curl -LSs "https://raw.githubusercontent.com/dre698/NadekoSU/main/kernel/setup.sh" | bash
-
       - name: Build Kernel
         run: |
+          # Гибридный PATH: Clang главный, GCC подхватывается, когда Makefile MTK требует легаси
           export PATH="/tmp/clang/bin:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
 
           export ARCH=${KERNEL_ARCH}
@@ -68,11 +59,20 @@ jobs:
           export CC="clang"
           export CLANG_TRIPLE="aarch64-linux-gnu-"
 
-          echo "Running defconfig..."
+          echo "⚙️ Генерация .config из ${KERNEL_DEFCONFIG}..."
           make O=out ARCH=${ARCH} ${KERNEL_DEFCONFIG}
+          
+          echo "🔍 Проверка наличия KernelSU в сгенерированном .config..."
+          if grep -q "CONFIG_KSU=y" out/.config && grep -q "CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+            echo "✅ KernelSU успешно активирован в конфиге!"
+          else
+            echo "⚠️ ВНИМАНИЕ: KernelSU отсутствует или отключен в .config. Сборка продолжится, но KSU не будет работать."
+          fi
 
-          echo "Building kernel..."
-          # Гибридная сборка: Clang компилирует C-код, GCC обрабатывает легаси и ассемблер
+          echo "🚀 Начало компиляции ядра..."
+          # ВАЖНО: Мы НЕ указываем 'dtbo.img' или 'Image.gz-dtb' явно. 
+          # Мы запускаем make без целей, чтобы сработал дефолтный таргет 'all' из Makefile MTK, 
+          # который сам корректно соберет Image.gz-dtb и проигнорирует отсутствующий dtbo.img.
           make -j$(nproc) \
             O=out \
             ARCH=${ARCH} \
@@ -80,23 +80,27 @@ jobs:
             CLANG_TRIPLE=${CLANG_TRIPLE} \
             CROSS_COMPILE=${CROSS_COMPILE} \
             CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
-            Image.gz-dtb dtbo.img
+            2>&1 | tee build.log
 
-      - name: Check KernelSU config
-        if: success()
+      - name: Verify Output
         run: |
-          if grep -q "CONFIG_KSU=y" out/.config; then
-            echo "✅ KernelSU (NadekoSU) успешно интегрирован в .config"
+          echo "🔎 Поиск скомпилированного образа ядра..."
+          if [ -f "out/arch/${KERNEL_ARCH}/boot/Image.gz-dtb" ]; then
+            echo "✅ Успешно собран: Image.gz-dtb"
+          elif [ -f "out/arch/${KERNEL_ARCH}/boot/Image.gz" ]; then
+            echo "✅ Успешно собран: Image.gz"
           else
-            echo "⚠️ KernelSU отключен в .config (проверь Makefile драйверов)"
+            echo "❌ Образ ядра не найден! Проверь build.log"
+            exit 1
           fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: blossom-kernel-build
+          name: sashimi-kernel-blossom-${{ github.sha }}
           path: |
             out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb
-            out/arch/${{ env.KERNEL_ARCH }}/boot/dtbo.img
+            out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz
             out/.config
-          retention-days: 7
+            build.log
+          retention-days: 14
