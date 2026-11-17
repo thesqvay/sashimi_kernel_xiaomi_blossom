@@ -3,9 +3,6 @@ name: Build Sashimi Kernel
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - Esd
 
 jobs:
   build:
