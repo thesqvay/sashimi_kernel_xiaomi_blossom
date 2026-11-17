@@ -1,5 +1,5 @@
 
-name: Integrate BakaSU
+name: Reintegrate BakaSU
 
 on:
   workflow_dispatch:
@@ -12,27 +12,114 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout Esd branch
+      - name: Checkout Esd
         uses: actions/checkout@v4
         with:
           ref: Esd
           fetch-depth: 0
 
-      - name: Integrate BakaSU
+      - name: Remove previous integration
+        shell: bash
         run: |
-          curl -LSs https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh | bash
+          set -euo pipefail
 
-      - name: Commit integration
+          # Remove old KernelSU gitlink if present
+          if git ls-files --stage KernelSU | grep -q '^160000 '; then
+            git rm -f -- KernelSU
+          fi
+
+          # Remove old source directory and driver symlink
+          rm -rf KernelSU
+          rm -f drivers/kernelsu
+
+          # Remove old BakaSU entries
+          sed -i '\|^obj-$(CONFIG_KSU) += kernelsu/$|d' drivers/Makefile
+          sed -i '\|^source "drivers/kernelsu/Kconfig"$|d' drivers/Kconfig
+
+      - name: Download and run official BakaSU setup
+        shell: bash
         run: |
+          set -euo pipefail
+
+          curl -fL \
+            https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh \
+            -o /tmp/bakasu-setup.sh
+
+          bash /tmp/bakasu-setup.sh
+
+      - name: Convert BakaSU into normal source files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d KernelSU/kernel
+          test -f KernelSU/kernel/Kconfig
+
+          # Prevent Git from recording KernelSU as a submodule
+          rm -rf KernelSU/.git
+
+          # Verify driver symlink
+          test -L drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+
+          # Verify Makefile and Kconfig entries
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
+          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: Configure BakaSU
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("arch/arm64/configs/blossom_defconfig")
+          lines = path.read_text().splitlines()
+
+          lines = [
+              line for line in lines
+              if not re.match(
+                  r'^(# )?CONFIG_KSU(_MANUAL_HOOK)?(=| is not set$)',
+                  line
+              )
+          ]
+
+          lines += [
+              "",
+              "# BakaSU",
+              "CONFIG_KSU=y",
+              "CONFIG_KSU_MANUAL_HOOK=y"
+          ]
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add KernelSU drivers/Makefile drivers/Kconfig
+          git add -A \
+            KernelSU \
+            drivers/Makefile \
+            drivers/Kconfig \
+            drivers/kernelsu \
+            arch/arm64/configs/blossom_defconfig
+
+          # Refuse to commit another gitlink
+          if git ls-files --stage KernelSU | grep -q '^160000 '; then
+            echo "ERROR: KernelSU is still a gitlink!"
+            exit 1
+          fi
 
           if ! git diff --cached --quiet; then
-            git commit -m "Integrate BakaSU into kernel"
+            git commit -m "Integrate BakaSU sources correctly"
             git push origin HEAD:Esd
           else
             echo "No changes to commit"
           fi
-          
