@@ -1,66 +1,71 @@
 
-name: Build Esd
+name: Build Sashimi Kernel
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: read
+  push:
+    branches:
+      - Esd
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+
     steps:
-      - name: Checkout
+      - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: Esd
+          fetch-depth: 0
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            bc bison build-essential flex \
-            libssl-dev libelf-dev \
-            python3 python-is-python3 \
-            gcc-aarch64-linux-gnu \
+            bc bison build-essential \
+            flex gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
             clang-15 lld-15 llvm-15 \
-            ccache
+            libssl-dev libelf-dev \
+            python3 python3-pip \
+            rsync
 
-      - name: Check compiler
+      - name: Check toolchain
         run: |
           clang-15 --version
           ld.lld-15 --version
+          aarch64-linux-gnu-gcc --version
 
-      - name: Configure
+      - name: Configure kernel
         run: |
-          make ARCH=arm64 LLVM=1 \
-            LLVM_IAS=1 \
-            CC=clang-15 \
-            LD=ld.lld-15 \
+          make ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
             blossom_defconfig
 
       - name: Verify configuration
         run: |
-          grep -E 'CONFIG_KSU|CONFIG_KSU_MANUAL_HOOK' .config
-          grep -E 'CONFIG_KSU_MANUAL_HOOK_AUTO' .config || true
+          grep -q '^CONFIG_KSU=y' .config
+          grep -q '^CONFIG_KSU_MANUAL_HOOK=y' .config
+          if grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' .config; then
+            echo "ERROR: TRACEPOINT_HOOK must be disabled"
+            exit 1
+          fi
+          echo "KernelSU configuration verified"
 
       - name: Build kernel
         run: |
-          make -j$(nproc) ARCH=arm64 \
-            LLVM=1 LLVM_IAS=1 \
-            CC=clang-15 LD=ld.lld-15 \
-            Image.gz-dtb dtbs
+          make -j2 ARCH=arm64 LLVM=1 LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            Image.gz-dtb
 
-      - name: Upload kernel
+      - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Sashimi-Redmi9A-Image
+          name: Sashimi-Kernel-Esd
           path: |
             arch/arm64/boot/Image.gz
-            arch/arm64/boot/Image.gz-dtb
-            arch/arm64/boot/dts/**/*.dtb
+            arch/arm64/boot/dts/
           if-no-files-found: error
           retention-days: 7
-          
