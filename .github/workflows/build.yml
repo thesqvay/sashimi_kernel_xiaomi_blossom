@@ -25,9 +25,10 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex g++-multilib gcc-multilib git gnupg gperf imagemagick libncurses5 libncurses5-dev libssl-dev libxml2 libxml2-utils lzop make maven ninja-build pngcrush python3 rsync schedtool squashfs-tools wget xsltproc zip zlib1g-dev zstd
-          # Устанавливаем утилиты для LLVM/LLD
-          sudo apt-get install -y llvm lld clang
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git gperf \
+            libelf-dev libncurses-dev libssl-dev libxml2-utils \
+            lzop make python3 rsync wget zip zlib1g-dev zstd
           mkdir -p $GITHUB_WORKSPACE/toolchain
           
       - name: Download Toolchain (Clang 15)
