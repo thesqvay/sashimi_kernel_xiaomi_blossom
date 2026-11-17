@@ -13,6 +13,7 @@
 
 #ion
 ccflags-y += -I$(srctree)/drivers/iommu/
+ccflags-y += -I$(srctree)/drivers/misc/mediatek/ccu/src/$(MTK_PLATFORM)/
 ifeq ($(CONFIG_MTK_ION),y)
     ccflags-y += -I$(srctree)/drivers/staging/android/mtk_ion/
     ccflags-y += -I$(srctree)/drivers/staging/android/mtk_ion/mtk/
