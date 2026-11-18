@@ -104,21 +104,32 @@ Description:
 return:
 	Executive outcomes. 0---pipe 0. 1---pipe 1.
 *******************************************************/
-uint8_t nvt_get_fw_pipe(void)
+int32_t nvt_get_fw_pipe(void)
 {
-	uint8_t buf[8]= {0};
+	uint8_t buf[2] = {0};
+	int32_t ret;
 
-	//---set xdata index to EVENT BUF ADDR---
-	nvt_set_page(ts->mmap->EVENT_BUF_ADDR | EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE);
+	if (!ts || !ts->mmap || !ts->client)
+		return -EINVAL;
 
-	//---read fw status---
-	buf[0] = EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE;
-	buf[1] = 0x00;
-	CTP_SPI_READ(ts->client, buf, 2);
+	ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR |
+			   EVENT_MAP_HANDSHAKING_OR_SUB_CMD_BYTE);
+	if (ret)
+		goto out;
 
-	//NVT_LOG("FW pipe=%d, buf[1]=0x%02X\n", (buf[1]&0x01), buf[1]);
+	buf[0] = EVENT_MAP_HANDSHAKING_OR_SUB_CMD_BYTE;
 
-	return (buf[1] & 0x01);
+	ret = CTP_SPI_READ(ts->client, buf, 2);
+	if (ret)
+		goto out;
+
+	ret = (buf[1] >> 0) & 0x01;
+
+out:
+	if (ret < 0)
+		pr_err("[NVT-DIAG] get firmware pipe failed: %d\n", ret);
+
+	return ret;
 }
 
 /*******************************************************
@@ -128,36 +139,143 @@ Description:
 return:
 	n.a.
 *******************************************************/
-int32_t nvt_read_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
+/*
+ * Read one XDATA matrix into the supplied destination.
+ *
+ * The destination is updated only after all matrix and button
+ * data has been read successfully.
+ */
+static int32_t nvt_read_matrix(uint32_t xdata_addr,
+			       uint32_t xdata_btn_addr,
+			       int32_t *dest)
 {
-    int32_t i = 0;
-    int32_t j = 0;
-    int32_t k = 0;
-    int32_t ret = 0;
+	int32_t i;
+	int32_t ret = 0;
+	int32_t restore_ret;
+	uint32_t matrix_size;
+	uint32_t dummy_len;
+	uint32_t read_len;
+	uint32_t head_addr;
+	uint32_t offset;
+	uint32_t value_count;
+	uint8_t buf[SPI_TANSFER_LENGTH + 1] = {0};
 
-    uint8_t buf[SPI_TANSFER_LENGTH + 1] = {0};
-    uint32_t head_addr = 0;
-    uint32_t dummy_len = 0;
-    uint32_t data_len = 0;
-    uint32_t residual_len = 0;
-    uint32_t total_len = 0;
+#if TOUCH_KEY_NUM > 0
+	uint8_t btn_buf[TOUCH_KEY_NUM * 2 + 1] = {0};
+#endif
 
-	//---set xdata sector address & length---
+	if (!ts || !ts->client || !ts->mmap || !dest)
+		return -EINVAL;
+
+	if (!ts->x_num || !ts->y_num)
+		return -EINVAL;
+
+	value_count = (uint32_t)ts->x_num * ts->y_num;
+
+	if (value_count > (sizeof(xdata) / sizeof(xdata[0])) -
+			  TOUCH_KEY_NUM)
+		return -EINVAL;
+
+	matrix_size = value_count * 2;
 	head_addr = xdata_addr - (xdata_addr % XDATA_SECTOR_SIZE);
 	dummy_len = xdata_addr - head_addr;
-	data_len = ts->x_num * ts->y_num * 2;
-	residual_len = (head_addr + dummy_len + data_len) % XDATA_SECTOR_SIZE;
 
-	total_len = dummy_len + data_len;
+	if (matrix_size > sizeof(xdata_tmp) ||
+	    dummy_len > sizeof(xdata_tmp) - matrix_size)
+		return -EINVAL;
 
-if (!ts->x_num || !ts->y_num ||
-    (uint64_t)ts->x_num * ts->y_num * 2 >
-    sizeof(xdata_tmp) ||
-    ((total_len + XDATA_SECTOR_SIZE - 1) /
-     XDATA_SECTOR_SIZE * XDATA_SECTOR_SIZE) >
-    sizeof(xdata_tmp)) {
-    pr_err("[NVT-DIAG] Invalid mdata dimensions or buffer size\n");
-    return -EINVAL;
+	read_len = dummy_len + matrix_size;
+
+	if (read_len > sizeof(xdata_tmp) -
+		       (XDATA_SECTOR_SIZE - 1))
+		return -EINVAL;
+
+	read_len = ((read_len + XDATA_SECTOR_SIZE - 1) /
+		    XDATA_SECTOR_SIZE) * XDATA_SECTOR_SIZE;
+
+	if (read_len > sizeof(xdata_tmp))
+		return -EINVAL;
+
+	/*
+	 * Read complete XDATA sectors.
+	 * Each transfer reads one 256-byte sector.
+	 */
+	for (offset = 0; offset < read_len;
+	     offset += XDATA_SECTOR_SIZE) {
+
+		ret = nvt_set_page(head_addr + offset);
+		if (ret)
+			goto restore_page;
+
+		buf[0] = 0;
+
+		ret = CTP_SPI_READ(ts->client, buf,
+				   SPI_TANSFER_LENGTH + 1);
+		if (ret)
+			goto restore_page;
+
+		memcpy(&xdata_tmp[offset], &buf[1],
+		       SPI_TANSFER_LENGTH);
+	}
+
+#if TOUCH_KEY_NUM > 0
+	ret = nvt_set_page(xdata_btn_addr);
+	if (ret)
+		goto restore_page;
+
+	btn_buf[0] = xdata_btn_addr & 0xFF;
+
+	ret = CTP_SPI_READ(ts->client, btn_buf,
+			   sizeof(btn_buf));
+	if (ret)
+		goto restore_page;
+#endif
+
+	/*
+	 * Commit matrix data only after successful SPI reads.
+	 */
+	for (i = 0; i < value_count; i++) {
+		uint16_t raw;
+
+		raw = xdata_tmp[dummy_len + i * 2] |
+		      ((uint16_t)xdata_tmp[dummy_len + i * 2 + 1] << 8);
+
+		dest[i] = (int16_t)raw;
+	}
+
+#if TOUCH_KEY_NUM > 0
+	for (i = 0; i < TOUCH_KEY_NUM; i++) {
+		uint16_t raw;
+
+		raw = btn_buf[1 + i * 2] |
+		      ((uint16_t)btn_buf[2 + i * 2] << 8);
+
+		dest[value_count + i] = (int16_t)raw;
+	}
+#endif
+
+restore_page:
+	restore_ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+
+	if (!ret && restore_ret)
+		ret = restore_ret;
+
+	if (ret)
+		pr_err("[NVT-DIAG] XDATA read failed: addr=0x%08X ret=%d\n",
+		       xdata_addr, ret);
+
+	return ret;
+}
+
+int32_t nvt_read_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
+{
+	return nvt_read_matrix(xdata_addr, xdata_btn_addr, xdata);
+}
+
+int32_t nvt_read_diff_mdata(uint32_t xdata_addr,
+			    uint32_t xdata_btn_addr)
+{
+	return nvt_read_matrix(xdata_addr, xdata_btn_addr, diff_data);
 }
 
 	//printk("head_addr=0x%05X, dummy_len=0x%05X, data_len=0x%05X, residual_len=0x%05X\n", head_addr, dummy_len, data_len, residual_len);
@@ -348,29 +466,38 @@ Description:
 return:
 	n.a.
 *******************************************************/
+
 static int32_t nvt_fw_version_open(struct inode *inode, struct file *file)
 {
-	if (mutex_lock_interruptible(&ts->lock)) {
+	int ret;
+
+	if (mutex_lock_interruptible(&ts->lock))
 		return -ERESTARTSYS;
-	}
 
 	NVT_LOG("++\n");
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	if (nvt_get_fw_info()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	ret = nvt_get_fw_info();
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
+
+	if (ret) {
+		pr_err("[NVT-DIAG] Firmware info read failed: %d\n", ret);
+		return ret;
+	}
 
 	NVT_LOG("--\n");
 
 	return seq_open(file, &nvt_fw_version_seq_ops);
 }
+
 
 static const struct file_operations nvt_fw_version_fops = {
 	.owner = THIS_MODULE,
@@ -401,22 +528,25 @@ static int32_t nvt_baseline_open(struct inode *inode, struct file *file)
 	nvt_esd_check_enable(false);
 #endif
 
-	if (nvt_clear_fw_status())
+	ret = nvt_clear_fw_status();
+	if (ret)
 		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
 	test_mode = true;
 
-	if (nvt_check_fw_status())
+	ret = nvt_check_fw_status();
+	if (ret)
 		goto out;
 
-	if (nvt_get_fw_info())
+	ret = nvt_get_fw_info();
+	if (ret)
 		goto out;
 
-	nvt_read_mdata(ts->mmap->BASELINE_ADDR,
-		       ts->mmap->BASELINE_BTN_ADDR);
-
-	ret = 0;
+	ret = nvt_read_mdata(ts->mmap->BASELINE_ADDR,
+			     ts->mmap->BASELINE_BTN_ADDR);
+	if (ret)
+		pr_err("[NVT-DIAG] BASELINE read failed: %d\n", ret);
 
 out:
 	if (test_mode)
@@ -465,26 +595,31 @@ static int32_t nvt_raw_open(struct inode *inode, struct file *file)
 	nvt_esd_check_enable(false);
 #endif
 
-	if (nvt_clear_fw_status())
+	ret = nvt_clear_fw_status();
+	if (ret)
 		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
 	test_mode = true;
 
-	if (nvt_check_fw_status())
+	ret = nvt_check_fw_status();
+	if (ret)
 		goto out;
 
-	if (nvt_get_fw_info())
+	ret = nvt_get_fw_info();
+	if (ret)
 		goto out;
 
-	if (nvt_get_fw_pipe() == 0)
-		nvt_read_mdata(ts->mmap->RAW_PIPE0_ADDR,
-			       ts->mmap->RAW_BTN_PIPE0_ADDR);
-	else
-		nvt_read_mdata(ts->mmap->RAW_PIPE1_ADDR,
-			       ts->mmap->RAW_BTN_PIPE1_ADDR);
+	if (nvt_get_fw_pipe() == 0) {
+		ret = nvt_read_mdata(ts->mmap->RAW_PIPE0_ADDR,
+				     ts->mmap->RAW_BTN_PIPE0_ADDR);
+	} else {
+		ret = nvt_read_mdata(ts->mmap->RAW_PIPE1_ADDR,
+				     ts->mmap->RAW_BTN_PIPE1_ADDR);
+	}
 
-	ret = 0;
+	if (ret)
+		pr_err("[NVT-DIAG] RAW read failed: %d\n", ret);
 
 out:
 	if (test_mode)
@@ -533,26 +668,31 @@ static int32_t nvt_diff_open(struct inode *inode, struct file *file)
 	nvt_esd_check_enable(false);
 #endif
 
-	if (nvt_clear_fw_status())
+	ret = nvt_clear_fw_status();
+	if (ret)
 		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
 	test_mode = true;
 
-	if (nvt_check_fw_status())
+	ret = nvt_check_fw_status();
+	if (ret)
 		goto out;
 
-	if (nvt_get_fw_info())
+	ret = nvt_get_fw_info();
+	if (ret)
 		goto out;
 
-	if (nvt_get_fw_pipe() == 0)
-		nvt_read_mdata(ts->mmap->DIFF_PIPE0_ADDR,
-			       ts->mmap->DIFF_BTN_PIPE0_ADDR);
-	else
-		nvt_read_mdata(ts->mmap->DIFF_PIPE1_ADDR,
-			       ts->mmap->DIFF_BTN_PIPE1_ADDR);
+	if (nvt_get_fw_pipe() == 0) {
+		ret = nvt_read_diff_mdata(ts->mmap->DIFF_PIPE0_ADDR,
+					  ts->mmap->DIFF_BTN_PIPE0_ADDR);
+	} else {
+		ret = nvt_read_diff_mdata(ts->mmap->DIFF_PIPE1_ADDR,
+					  ts->mmap->DIFF_BTN_PIPE1_ADDR);
+	}
 
-	ret = 0;
+	if (ret)
+		pr_err("[NVT-DIAG] DIFF read failed: %d\n", ret);
 
 out:
 	if (test_mode)
@@ -635,86 +775,15 @@ Description:
 return:
 	n.a.
 *******************************************************/
-void ad_diff_nvt_remdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
+void ad_diff_nvt_remdata(uint32_t xdata_addr,
+                         uint32_t xdata_btn_addr)
 {
-	int32_t i = 0;
-	int32_t j = 0;
-	int32_t k = 0;
-	uint8_t buf[SPI_TANSFER_LENGTH + 1] = {0};
-	uint32_t head_addr = 0;
-	int32_t dummy_len = 0;
-	int32_t data_len = 0;
-	int32_t residual_len = 0;
+    int32_t ret;
 
-	//---set diff_data sector address & length---
-	head_addr = xdata_addr - (xdata_addr % XDATA_SECTOR_SIZE);
-	dummy_len = xdata_addr - head_addr;
-	data_len = ts->x_num * ts->y_num * 2;
-	residual_len = (head_addr + dummy_len + data_len) % XDATA_SECTOR_SIZE;
+    ret = nvt_read_diff_mdata(xdata_addr, xdata_btn_addr);
 
-	//printk("head_addr=0x%05X, dummy_len=0x%05X, data_len=0x%05X, residual_len=0x%05X\n", head_addr, dummy_len, data_len, residual_len);
-
-	//read diff_data : step 1
-	for (i = 0; i < ((dummy_len + data_len) / XDATA_SECTOR_SIZE); i++) {
-		//---read diff_data by SPI_TANSFER_LENGTH
-		for (j = 0; j < (XDATA_SECTOR_SIZE / SPI_TANSFER_LENGTH); j++) {
-			//---change diff_data index---
-			nvt_set_page(head_addr + (XDATA_SECTOR_SIZE * i) + (SPI_TANSFER_LENGTH * j));
-
-			//---read data---
-			buf[0] = SPI_TANSFER_LENGTH * j;
-			CTP_SPI_READ(ts->client, buf, SPI_TANSFER_LENGTH + 1);
-
-			//---copy buf to xdata_tmp---
-			for (k = 0; k < SPI_TANSFER_LENGTH; k++) {
-				xdata_tmp[XDATA_SECTOR_SIZE * i + SPI_TANSFER_LENGTH * j + k] = buf[k + 1];
-				//printk("0x%02X, 0x%04X\n", buf[k+1], (XDATA_SECTOR_SIZE*i + SPI_TANSFER_LENGTH*j + k));
-			}
-		}
-		//printk("addr=0x%05X\n", (head_addr+XDATA_SECTOR_SIZE*i));
-	}
-
-	//read diff_data : step2
-	if (residual_len != 0) {
-		//---read diff_data by SPI_TANSFER_LENGTH
-		for (j = 0; j < (residual_len / SPI_TANSFER_LENGTH + 1); j++) {
-			//---change diff_data index---
-			nvt_set_page(xdata_addr + data_len - residual_len + (SPI_TANSFER_LENGTH * j));
-
-			//---read data---
-			buf[0] = SPI_TANSFER_LENGTH * j;
-			CTP_SPI_READ(ts->client, buf, SPI_TANSFER_LENGTH + 1);
-
-			//---copy buf to xdata_tmp---
-			for (k = 0; k < SPI_TANSFER_LENGTH; k++) {
-				xdata_tmp[(dummy_len + data_len - residual_len) + SPI_TANSFER_LENGTH * j + k] = buf[k + 1];
-				//printk("0x%02X, 0x%04x\n", buf[k+1], ((dummy_len+data_len-residual_len) + SPI_TANSFER_LENGTH*j + k));
-			}
-		}
-		//printk("addr=0x%05X\n", (xdata_addr+data_len-residual_len));
-	}
-
-	//---remove dummy data and 2bytes-to-1data---
-	for (i = 0; i < (data_len / 2); i++) {
-		diff_data[i] = (int16_t)(xdata_tmp[dummy_len + i * 2] + 256 * xdata_tmp[dummy_len + i * 2 + 1]);
-	}
-
-#if TOUCH_KEY_NUM > 0
-	//read button diff_data : step3
-	//---change diff_data index---
-	nvt_set_page(xdata_btn_addr);
-	//---read data---
-	buf[0] = (xdata_btn_addr & 0xFF);
-	CTP_SPI_READ(ts->client, buf, (TOUCH_KEY_NUM * 2 + 1));
-
-	//---2bytes-to-1data---
-	for (i = 0; i < TOUCH_KEY_NUM; i++) {
-		diff_data[ts->x_num * ts->y_num + i] = (int16_t)(buf[1 + i * 2] + 256 * buf[1 + i * 2 + 1]);
-	}
-#endif
-
-	//---set diff_data index to EVENT BUF ADDR---
-	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+    if (ret)
+        pr_err("[NVT-DIAG] Legacy DIFF read failed: %d\n", ret);
 }
 
 /*******************************************************
@@ -830,53 +899,81 @@ Description:
 return:
 	Executive outcomes. 0---succeed.
 *******************************************************/
+
 static int32_t lct_tp_data_dump_open(struct inode *inode, struct file *file)
 {
-	if (mutex_lock_interruptible(&ts->lock)) {
+	int ret = -EAGAIN;
+	int32_t pipe;
+	bool test_mode = false;
+
+	if (mutex_lock_interruptible(&ts->lock))
 		return -ERESTARTSYS;
-	}
 
 	NVT_LOG("++\n");
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	if (nvt_clear_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	ret = nvt_clear_fw_status();
+	if (ret)
+		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
+	test_mode = true;
 
-	if (nvt_check_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
+	ret = nvt_check_fw_status();
+	if (ret)
+		goto out;
+
+	ret = nvt_get_fw_info();
+	if (ret)
+		goto out;
+
+	pipe = nvt_get_fw_pipe();
+
+	if (pipe == 0) {
+		ret = nvt_read_mdata(ts->mmap->RAW_PIPE0_ADDR,
+				     ts->mmap->RAW_BTN_PIPE0_ADDR);
+	} else {
+		ret = nvt_read_mdata(ts->mmap->RAW_PIPE1_ADDR,
+				     ts->mmap->RAW_BTN_PIPE1_ADDR);
 	}
 
-	if (nvt_get_fw_info()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
+	if (ret) {
+		pr_err("[NVT-DIAG] tp_data_dump RAW read failed: %d\n", ret);
+		goto out;
 	}
 
-	if (nvt_get_fw_pipe() == 0)
-		nvt_read_mdata(ts->mmap->RAW_PIPE0_ADDR, ts->mmap->RAW_BTN_PIPE0_ADDR);
-	else
-		nvt_read_mdata(ts->mmap->RAW_PIPE1_ADDR, ts->mmap->RAW_BTN_PIPE1_ADDR);
+	if (pipe == 0) {
+		ret = nvt_read_diff_mdata(ts->mmap->DIFF_PIPE0_ADDR,
+					  ts->mmap->DIFF_BTN_PIPE0_ADDR);
+	} else {
+		ret = nvt_read_diff_mdata(ts->mmap->DIFF_PIPE1_ADDR,
+					  ts->mmap->DIFF_BTN_PIPE1_ADDR);
+	}
 
-	if (nvt_get_fw_pipe() == 0)
-		nvt_read_diff_mdata(ts->mmap->DIFF_PIPE0_ADDR, ts->mmap->DIFF_BTN_PIPE0_ADDR);
-	else
-		nvt_read_diff_mdata(ts->mmap->DIFF_PIPE1_ADDR, ts->mmap->DIFF_BTN_PIPE1_ADDR);
+	if (ret)
+		pr_err("[NVT-DIAG] tp_data_dump DIFF read failed: %d\n", ret);
 
-	nvt_change_mode(NORMAL_MODE);
+out:
+	if (test_mode)
+		nvt_change_mode(NORMAL_MODE);
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
+
+	if (ret)
+		return ret;
 
 	NVT_LOG("--\n");
 
 	return seq_open(file, &lct_tp_data_dump_seq_ops);
 }
+
 
 static const struct file_operations lct_tp_data_dump_fops = {
 	.owner = THIS_MODULE,
@@ -950,112 +1047,116 @@ nvt_get_pf_switch_out:
 	return ret;
 }
 
-static ssize_t nvt_pf_switch_proc_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+
+static ssize_t nvt_pf_switch_proc_read(struct file *filp,
+				       char __user *buf,
+				       size_t count,
+				       loff_t *f_pos)
 {
-	static int finished = 0;
-	int32_t cnt = 0;
-	int32_t len = 0;
-	uint8_t pf_switch;
+	int ret;
+	uint8_t pf_switch = 0;
 	char tmp_buf[64];
+	int len;
 
-	NVT_LOG("++\n");
-	/*
-	* We return 0 to indicate end of file, that we have
-	* no more information. Otherwise, processes will
-	* continue to read from us in an endless loop.
-	*/
-	if (finished) {
-		NVT_LOG("read END\n");
-		finished = 0;
+	if (*f_pos >= 64)
 		return 0;
-	}
-	finished = 1;
 
-	if (mutex_lock_interruptible(&ts->lock)) {
+	if (mutex_lock_interruptible(&ts->lock))
 		return -ERESTARTSYS;
-	}
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	nvt_get_pf_switch(&pf_switch);
+	ret = nvt_get_pf_switch(&pf_switch);
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
-//2019.12.21 longcheer taocheng edit for enable pf_proc
-	cnt = snprintf(tmp_buf, sizeof(tmp_buf), "pf_switch: %d\n", pf_switch);
-	if (copy_to_user(buf, tmp_buf, sizeof(tmp_buf))) {
-		NVT_ERR("copy_to_user() error!\n");
-		return -EFAULT;
-	}
-	len += cnt;
 
-	NVT_LOG("--\n");
-	return len;
+	if (ret) {
+		pr_err("[NVT-DIAG] PF switch read failed: %d\n", ret);
+		return ret;
+	}
+
+	len = snprintf(tmp_buf, sizeof(tmp_buf),
+		       "pf_switch: %u\n", pf_switch);
+
+	return simple_read_from_buffer(buf, count, f_pos,
+				       tmp_buf, len);
 }
 
-static ssize_t nvt_pf_switch_proc_write(struct file *filp,const char __user *buf, size_t count, loff_t *f_pos)
+
+
+static ssize_t nvt_pf_switch_proc_write(struct file *filp,
+					const char __user *buf,
+					size_t count,
+					loff_t *f_pos)
 {
-	int32_t ret;
-	int32_t tmp;
-	uint8_t pf_switch;
+	int ret;
+	int tmp;
 	char *tmp_buf;
+	uint8_t pf_switch;
 
-	NVT_LOG("++\n");
+	if (count == 0 || count > 16)
+		return -EINVAL;
 
-	if (count == 0 || count > 2) {
-		NVT_ERR("Invalid value! count = %zu\n", count);
-		ret = -EINVAL;
-		goto out;
-	}
+	tmp_buf = kzalloc(count + 1, GFP_KERNEL);
+	if (!tmp_buf)
+		return -ENOMEM;
 
-	/*2019.12.21 longcheer taocheng add for enable pf_proc start*/
-	/*function description*/
-	tmp_buf = kzalloc(count, GFP_KERNEL);
-	if (!tmp_buf) {
-		NVT_ERR("Allocate tmp_buf fail!\n");
-		ret = -ENOMEM;
-		goto out;
-	}
 	if (copy_from_user(tmp_buf, buf, count)) {
-		NVT_ERR("copy_from_user() error!\n");
 		ret = -EFAULT;
-		goto out;
+		goto out_free;
 	}
-	/*2019.12.21 longcheer taocheng add for enable pf_proc end*/
 
-	ret = sscanf(tmp_buf, "%d", &tmp);
-	if (ret != 1) {
-		NVT_ERR("Invalid value! ret = %d\n", ret);
-		ret = -EINVAL;
-		goto out;
+	tmp_buf[count] = '\0';
+
+	ret = kstrtoint(tmp_buf, 10, &tmp);
+	if (ret) {
+		pr_err("[NVT-DIAG] Invalid PF switch input\n");
+		goto out_free;
 	}
+
 	if (tmp < 0 || tmp > 2) {
-		NVT_ERR("Invalid value! tmp = %d\n", tmp);
+		pr_err("[NVT-DIAG] PF switch value out of range: %d\n", tmp);
 		ret = -EINVAL;
-		goto out;
+		goto out_free;
 	}
+
 	pf_switch = (uint8_t)tmp;
-	NVT_LOG("pf_switch = %d\n", pf_switch);
 
 	if (mutex_lock_interruptible(&ts->lock)) {
-		return -ERESTARTSYS;
+		ret = -ERESTARTSYS;
+		goto out_free;
 	}
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	nvt_set_pf_switch(pf_switch);
+	ret = nvt_set_pf_switch(pf_switch);
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
+
+	if (ret) {
+		pr_err("[NVT-DIAG] PF switch write failed: %d\n", ret);
+		goto out_free;
+	}
 
 	ret = count;
-out:
-//	kfree(tmp_buf);
-	NVT_LOG("--\n");
+
+out_free:
+	kfree(tmp_buf);
 	return ret;
 }
+
 
 static const struct file_operations nvt_pf_switch_fops = {
 	.owner = THIS_MODULE,
