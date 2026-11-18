@@ -21,6 +21,7 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/gpio.h>
+#include <linux/atomic.h>
 #include <linux/proc_fs.h>
 #include <linux/input/mt.h>
 #include <linux/of_gpio.h>
@@ -58,6 +59,25 @@ static unsigned long irq_timer = 0;
 uint8_t esd_check = false;
 uint8_t esd_retry = 0;
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
+
+/* ===== Novatek touch diagnostics ===== */
+
+static atomic_t nvt_diag_irq_count = ATOMIC_INIT(0);
+static atomic_t nvt_diag_spi_ok = ATOMIC_INIT(0);
+static atomic_t nvt_diag_spi_err = ATOMIC_INIT(0);
+static atomic_t nvt_diag_esd_marker = ATOMIC_INIT(0);
+static atomic_t nvt_diag_wdt_marker = ATOMIC_INIT(0);
+static atomic_t nvt_diag_fw_attempts = ATOMIC_INIT(0);
+
+static unsigned long nvt_diag_last_irq;
+static unsigned long nvt_diag_last_spi_ok;
+
+static int nvt_diag_last_spi_error;
+static int nvt_diag_last_fw_result;
+
+static unsigned int nvt_diag_report_count;
+
+/* ===== End diagnostics ===== */
 
 #if NVT_TOUCH_EXT_PROC
 extern int32_t nvt_extra_proc_init(void);
@@ -1233,13 +1253,53 @@ static void nvt_esd_check_func(struct work_struct *work)
 {
 	unsigned int timer = jiffies_to_msecs(jiffies - irq_timer);
 
+	    nvt_diag_report_count++;
+
+    if (nvt_diag_report_count >= 10) {
+        nvt_diag_report_count = 0;
+
+        NVT_ERR(
+            "[DIAG] irq=%d spi_ok=%d spi_err=%d "
+            "esd=%d wdt=%d fw=%d "
+            "last_irq=%lu ms last_spi=%lu ms "
+            "spi_ret=%d fw_ret=%d "
+            "esd_check=%d esd_retry=%d awake=%d irq_enabled=%d trigger=%u\n",
+            atomic_read(&nvt_diag_irq_count),
+            atomic_read(&nvt_diag_spi_ok),
+            atomic_read(&nvt_diag_spi_err),
+            atomic_read(&nvt_diag_esd_marker),
+            atomic_read(&nvt_diag_wdt_marker),
+            atomic_read(&nvt_diag_fw_attempts),
+            nvt_diag_last_irq ?
+                jiffies_to_msecs(jiffies - READ_ONCE(nvt_diag_last_irq)) : 0,
+            nvt_diag_last_spi_ok ?
+                jiffies_to_msecs(jiffies - READ_ONCE(nvt_diag_last_spi_ok)) : 0,
+            READ_ONCE(nvt_diag_last_spi_error),
+            READ_ONCE(nvt_diag_last_fw_result),
+            esd_check,
+            esd_retry,
+            bTouchIsAwake,
+            ts->irq_enabled,
+            ts->int_trigger_type
+        );
+    }
+
 	//NVT_LOG("esd_check = %d (retry %d)\n", esd_check, esd_retry);	//DEBUG
 
 	if ((timer > NVT_TOUCH_ESD_CHECK_PERIOD) && esd_check) {
 		mutex_lock(&ts->lock);
 		NVT_ERR("do ESD recovery, timer = %d, retry = %d\n", timer, esd_retry);
 		/* do esd recovery, reload fw */
-		nvt_update_firmware(ts->boot_update_firmware_name);
+		{
+    int fw_ret;
+
+    atomic_inc(&nvt_diag_fw_attempts);
+
+    fw_ret = nvt_update_firmware(ts->boot_update_firmware_name);
+    WRITE_ONCE(nvt_diag_last_fw_result, fw_ret);
+
+    NVT_ERR("[DIAG] ESD firmware recovery result=%d\n", fw_ret);
+}
 		mutex_unlock(&ts->lock);
 		/* update interrupt timer */
 		irq_timer = jiffies;
@@ -1301,6 +1361,9 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	int32_t i = 0;
 	int32_t finger_cnt = 0;
 
+    atomic_inc(&nvt_diag_irq_count);
+    WRITE_ONCE(nvt_diag_last_irq, jiffies);
+
 #if WAKEUP_GESTURE
 #ifdef CONFIG_PM
 	if (ts->dev_pm_suspend && ts->is_gesture_mode) {
@@ -1316,26 +1379,47 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
 	mutex_lock(&ts->lock);
 
 	ret = CTP_SPI_READ(ts->client, point_data, POINT_DATA_LEN + 1);
-	if (unlikely(ret < 0)) {
-		NVT_ERR("CTP_SPI_READ failed.(%d)\n", ret);
-		goto XFER_ERROR;
-	}
+
+if (unlikely(ret < 0)) {
+    atomic_inc(&nvt_diag_spi_err);
+    WRITE_ONCE(nvt_diag_last_spi_error, ret);
+
+    NVT_ERR("[DIAG] SPI READ FAILED ret=%d\n", ret);
+    goto XFER_ERROR;
+}
+
+atomic_inc(&nvt_diag_spi_ok);
+WRITE_ONCE(nvt_diag_last_spi_ok, jiffies);
 
 #if NVT_TOUCH_WDT_RECOVERY
    /* ESD protect by WDT */
    if (nvt_wdt_fw_recovery(point_data)) {
-       NVT_ERR("Recover for fw reset, %02X\n", point_data[1]);
-       nvt_update_firmware(ts->boot_update_firmware_name);
-       goto XFER_ERROR;
-   }
+    int fw_ret;
+
+    atomic_inc(&nvt_diag_wdt_marker);
+    atomic_inc(&nvt_diag_fw_attempts);
+
+    NVT_ERR("[DIAG] WDT marker detected: %02X\n", point_data[1]);
+
+    fw_ret = nvt_update_firmware(ts->boot_update_firmware_name);
+    WRITE_ONCE(nvt_diag_last_fw_result, fw_ret);
+
+    NVT_ERR("[DIAG] WDT firmware recovery result=%d\n", fw_ret);
+
+    goto XFER_ERROR;
+}
 #endif /* #if NVT_TOUCH_WDT_RECOVERY */
 
 #if NVT_TOUCH_ESD_PROTECT
 	/* ESD protect by FW handshake */
 	if (nvt_fw_recovery(point_data)) {
-		nvt_esd_check_enable(true);
-		goto XFER_ERROR;
-	}
+    atomic_inc(&nvt_diag_esd_marker);
+
+    NVT_ERR("[DIAG] ESD handshake marker detected\n");
+
+    nvt_esd_check_enable(true);
+    goto XFER_ERROR;
+}
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 
 #if WAKEUP_GESTURE
