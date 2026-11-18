@@ -113,11 +113,11 @@ int32_t nvt_get_fw_pipe(void)
 		return -EINVAL;
 
 	ret = nvt_set_page(ts->mmap->EVENT_BUF_ADDR |
-			   EVENT_MAP_HANDSHAKING_OR_SUB_CMD_BYTE);
+			   EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE);
 	if (ret)
 		goto out;
 
-	buf[0] = EVENT_MAP_HANDSHAKING_OR_SUB_CMD_BYTE;
+	buf[0] = EVENT_MAP_HANDSHAKING_or_SUB_CMD_BYTE;
 
 	ret = CTP_SPI_READ(ts->client, buf, 2);
 	if (ret)
@@ -269,78 +269,13 @@ restore_page:
 
 int32_t nvt_read_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
 {
-	return nvt_read_matrix(xdata_addr, xdata_btn_addr, xdata);
+    return nvt_read_matrix(xdata_addr, xdata_btn_addr, xdata);
 }
 
 int32_t nvt_read_diff_mdata(uint32_t xdata_addr,
-			    uint32_t xdata_btn_addr)
+                            uint32_t xdata_btn_addr)
 {
-	return nvt_read_matrix(xdata_addr, xdata_btn_addr, diff_data);
-}
-
-	//printk("head_addr=0x%05X, dummy_len=0x%05X, data_len=0x%05X, residual_len=0x%05X\n", head_addr, dummy_len, data_len, residual_len);
-
-	//read xdata : step 1
-	for (i = 0; i < ((dummy_len + data_len) / XDATA_SECTOR_SIZE); i++) {
-		//---read xdata by SPI_TANSFER_LENGTH
-		for (j = 0; j < (XDATA_SECTOR_SIZE / SPI_TANSFER_LENGTH); j++) {
-			//---change xdata index---
-			nvt_set_page(head_addr + (XDATA_SECTOR_SIZE * i) + (SPI_TANSFER_LENGTH * j));
-
-			//---read data---
-			buf[0] = SPI_TANSFER_LENGTH * j;
-			CTP_SPI_READ(ts->client, buf, SPI_TANSFER_LENGTH + 1);
-
-			//---copy buf to xdata_tmp---
-			for (k = 0; k < SPI_TANSFER_LENGTH; k++) {
-				xdata_tmp[XDATA_SECTOR_SIZE * i + SPI_TANSFER_LENGTH * j + k] = buf[k + 1];
-				//printk("0x%02X, 0x%04X\n", buf[k+1], (XDATA_SECTOR_SIZE*i + SPI_TANSFER_LENGTH*j + k));
-			}
-		}
-		//printk("addr=0x%05X\n", (head_addr+XDATA_SECTOR_SIZE*i));
-	}
-
-	//read xdata : step2
-	if (residual_len != 0) {
-		//---read xdata by SPI_TANSFER_LENGTH
-		for (j = 0; j < (residual_len / SPI_TANSFER_LENGTH + 1); j++) {
-			//---change xdata index---
-			nvt_set_page(xdata_addr + data_len - residual_len + (SPI_TANSFER_LENGTH * j));
-
-			//---read data---
-			buf[0] = SPI_TANSFER_LENGTH * j;
-			CTP_SPI_READ(ts->client, buf, SPI_TANSFER_LENGTH + 1);
-
-			//---copy buf to xdata_tmp---
-			for (k = 0; k < SPI_TANSFER_LENGTH; k++) {
-				xdata_tmp[(dummy_len + data_len - residual_len) + SPI_TANSFER_LENGTH * j + k] = buf[k + 1];
-				//printk("0x%02X, 0x%04x\n", buf[k+1], ((dummy_len+data_len-residual_len) + SPI_TANSFER_LENGTH*j + k));
-			}
-		}
-		//printk("addr=0x%05X\n", (xdata_addr+data_len-residual_len));
-	}
-
-	//---remove dummy data and 2bytes-to-1data---
-	for (i = 0; i < (data_len / 2); i++) {
-		xdata[i] = (int16_t)(xdata_tmp[dummy_len + i * 2] + 256 * xdata_tmp[dummy_len + i * 2 + 1]);
-	}
-
-#if TOUCH_KEY_NUM > 0
-	//read button xdata : step3
-	//---change xdata index---
-	nvt_set_page(xdata_btn_addr);
-	//---read data---
-	buf[0] = (xdata_btn_addr & 0xFF);
-	CTP_SPI_READ(ts->client, buf, (TOUCH_KEY_NUM * 2 + 1));
-
-	//---2bytes-to-1data---
-	for (i = 0; i < TOUCH_KEY_NUM; i++) {
-		xdata[ts->x_num * ts->y_num + i] = (int16_t)(buf[1 + i * 2] + 256 * buf[1 + i * 2 + 1]);
-	}
-#endif
-
-	//---set xdata index to EVENT BUF ADDR---
-	nvt_set_page(ts->mmap->EVENT_BUF_ADDR);
+    return nvt_read_matrix(xdata_addr, xdata_btn_addr, diff_data);
 }
 
 /*******************************************************
