@@ -2,17 +2,15 @@ name: Build Sashimi Kernel (blossom)
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "Esd" ]
 
 env:
   KERNEL_DEFCONFIG: blossom_defconfig
   KERNEL_ARCH: arm64
-
+  LLVM_VERSION: "23.1.0"
 jobs:
   build:
-    # СТРОГО 22.04! На 24.04+ нет пакета libncurses5-dev, который требуют скрипты MTK
-    runs-on: ubuntu-22.04 
+  
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout Source
@@ -22,64 +20,111 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
-          # Добавляем python-is-python3, так как скрипты MTK (DrvGen.py) часто вызывают 'python', а не 'python3'
           sudo apt-get install -y bc bison flex build-essential libssl-dev libelf-dev cpio kmod git zip curl ca-certificates jq \
-            wget libffi-dev zlib1g-dev libreadline-dev libsqlite3-dev libbz2-dev libncurses5-dev libgdbm-dev liblzma-dev tk-dev python3 python-is-python3
+            wget xz-utils libffi-dev zlib1g-dev libreadline-dev libsqlite3-dev libbz2-dev libncurses5-dev libgdbm-dev liblzma-dev tk-dev python3 python-is-python3
 
       - name: Configure git
         run: |
           git config --global http.sslVerify false
           git config --global url."https://".insteadOf git://
 
-      - name: Clone Toolchains (crDroid Clang + LineageOS GCC)
+      - name: Download ClangBuiltLinux Toolchain (Clang + LLD)
         run: |
-          echo "Cloning crdroid Clang (AOSP compatible)..."
-          git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r428724.git /tmp/clang
+          echo "Downloading ClangBuiltLinux ${{ env.LLVM_VERSION }} ..."
+          mkdir -p /tmp/clang-tc
+          curl -LSs "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${{ env.LLVM_VERSION }}-x86_64.tar.xz" \
+            | tar -xJ -C /tmp/clang-tc
 
-          echo "Cloning GCC ARM64 (для легаси MTK)..."
+          # Находим bin-директорию независимо от раскладки архива
+          if [ -x /tmp/clang-tc/bin/clang ]; then
+            CLANG_BIN=/tmp/clang-tc/bin
+          else
+            CLANG_BIN=$(dirname "$(find /tmp/clang-tc -name clang -print -quit)")
+          fi
+          if [ -z "$CLANG_BIN" ] || [ ! -x "$CLANG_BIN/clang" ]; then
+            echo "❌ clang не найден в архиве!"
+            exit 1
+          fi
+          echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
+          echo "✅ Clang bin: $CLANG_BIN"
+
+      - name: Clone LineageOS GCC toolchains (legacy fallback)
+        run: |
+          echo "Cloning GCC ARM64..."
           GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git /tmp/gcc-aarch64
 
-          echo "Cloning GCC ARM32 (для 32-битных бинарников в ядре)..."
+          echo "Cloning GCC ARM32 (нужен для compat/vdso32 в 4.19)..."
           GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git /tmp/gcc-arm
 
       - name: Verify Toolchains
         run: |
-          /tmp/clang/bin/clang --version
-          /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version
-          /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version
+          export PATH="${{ env.CLANG_BIN }}:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
+          clang --version | head -n 1
+          ld.lld --version | head -n 1
+          /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version | head -n 1
+          /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version | head -n 1
 
       - name: Build Kernel
         run: |
-          export PATH="/tmp/clang/bin:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
+          export PATH="${{ env.CLANG_BIN }}:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
 
           export ARCH=${KERNEL_ARCH}
           export CROSS_COMPILE="aarch64-linux-android-"
           export CROSS_COMPILE_ARM32="arm-linux-androideabi-"
-          export CC="clang"
           export CLANG_TRIPLE="aarch64-linux-gnu-"
+
+          # Ядро 4.19 НЕ понимает 'LLVM=1', поэтому передаём инструменты явно:
+          export CC=clang
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export STRIP=llvm-strip
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export OBJSIZE=llvm-size
+          export READELF=llvm-readelf
+          # Хостовые утилиты (fixdep и т.д.) тоже собираем LLVM, чтобы не словить elf_x86_64 от GNU ld:
+          export HOSTCC=clang
+          export HOSTCXX=clang++
+          export HOSTLD=ld.lld
+          export HOSTAR=llvm-ar
 
           echo "⚙️ Генерация .config из ${KERNEL_DEFCONFIG}..."
           make O=out ARCH=${ARCH} ${KERNEL_DEFCONFIG}
-          
+
           echo "🔍 Проверка наличия KernelSU в сгенерированном .config..."
           if grep -q "CONFIG_KSU=y" out/.config && grep -q "CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
             echo "✅ KernelSU успешно активирован в конфиге!"
           else
-            echo "⚠️ ВНИМАНИЕ: KernelSU отсутствует или отключен в .config. Сборка продолжится, но KSU не будет работать."
+            echo "⚠️ ВНИМАНИЕ: KernelSU отсутствует или отключен в .config."
           fi
 
-          echo "🚀 Начало компиляции ядра..."
-          # KCFLAGS="-Wno-unknown-warning-option" заставляет Clang игнорировать 
-          # специфичные для GCC флаги из Makefile'ов драйверов (GPU, Wi-Fi и т.д.).
-          # Это НЕ скрывает настоящие ошибки C-кода, а лишь убирает ругань на незнакомые флаги.
+          echo "🚀 Начало компиляции ядра (ClangBuiltLinux ${{ env.LLVM_VERSION }})..."
+          # -fcommon: старый MTK-код содержит tentative definitions, которые новые Clang
+          #           по умолчанию (-fno-common) превращают в multiple definition.
+          # -Wno-unknown-warning-option: игнорируем GCC-only флаги из Makefile'ов драйверов.
+          # -Wno-error=...: понижаем НОВЫЕ дефолтные ошибки Clang до предупреждений,
+          #           чтобы легаси C-код 4.19 компилировался, но сами предупреждения ВИДНЫ.
           make -j$(nproc) \
             O=out \
             ARCH=${ARCH} \
             CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            STRIP=llvm-strip \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            OBJSIZE=llvm-size \
+            READELF=llvm-readelf \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            HOSTLD=ld.lld \
+            HOSTAR=llvm-ar \
             CLANG_TRIPLE=${CLANG_TRIPLE} \
             CROSS_COMPILE=${CROSS_COMPILE} \
             CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
-            KCFLAGS="-Wno-unknown-warning-option" \
+            KCFLAGS="-fcommon -Wno-unknown-warning-option -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types" \
             2>&1 | tee build.log
 
       - name: Verify Output
@@ -99,7 +144,7 @@ jobs:
           git clone -b nadeko --depth=1 https://github.com/dre698/AnyKernel3.git anykernel
           cd anykernel
           rm -f zImage Image.gz Image.gz-dtb *.dtb
-          
+
           if [ -f "../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb" ]; then
             cp ../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb Image.gz-dtb
             echo "✓ Скопирован Image.gz-dtb"
@@ -107,7 +152,7 @@ jobs:
             cp ../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz Image.gz
             echo "✓ Скопирован Image.gz"
           fi
-          
+
           cat > anykernel.sh << 'EOF'
           properties() { '
           kernel.string=Sashimi Kernel
@@ -130,7 +175,7 @@ jobs:
           dump_boot;
           write_boot;
           EOF
-          
+
           rm -rf .git README.md .github *placeholder*
           ZIP_NAME="Sashimi-Kernel-blossom-$(date +%y%m%d-%H%M).zip"
           zip -r9 "../$ZIP_NAME" *
