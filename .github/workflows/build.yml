@@ -28,66 +28,69 @@ jobs:
           git config --global http.sslVerify false
           git config --global url."https://".insteadOf git://
 
-      - name: Download ClangBuiltLinux Toolchain (Clang + LLD)
+           - name: Download ClangBuiltLinux Toolchain (Clang + LLD)
         run: |
           echo "Downloading ClangBuiltLinux ${{ env.LLVM_VERSION }} ..."
           mkdir -p /tmp/clang-tc
           curl -LSs "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${{ env.LLVM_VERSION }}-x86_64.tar.xz" \
             | tar -xJ -C /tmp/clang-tc
 
-          # Находим bin-директорию независимо от раскладки архива
-          if [ -x /tmp/clang-tc/bin/clang ]; then
-            CLANG_BIN=/tmp/clang-tc/bin
-          else
-            CLANG_BIN=$(dirname "$(find /tmp/clang-tc -name clang -print -quit)")
-          fi
-          if [ -z "$CLANG_BIN" ] || [ ! -x "$CLANG_BIN/clang" ]; then
-            echo "❌ clang не найден в архиве!"
+          # Ищем ТОЛЬКО исполняемый файл/симлинк 'clang' (каталоги исключены!),
+          # и требуем, чтобы рядом лежал ld.lld — это и есть настоящий bin/
+          CLANG_BIN=""
+          for c in $(find /tmp/clang-tc \( -type f -o -type l \) -name clang -perm -u+x); do
+            d=$(dirname "$c")
+            if [ -e "$d/ld.lld" ]; then CLANG_BIN="$d"; break; fi
+          done
+          if [ -z "$CLANG_BIN" ]; then
+            echo "❌ Не найден исполняемый clang рядом с ld.lld!"
+            find /tmp/clang-tc -maxdepth 3 | head -n 40
             exit 1
           fi
+          chmod -R u+rx "$CLANG_BIN"
           echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
           echo "✅ Clang bin: $CLANG_BIN"
-
-      - name: Clone LineageOS GCC toolchains (legacy fallback)
-        run: |
-          echo "Cloning GCC ARM64..."
-          GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git /tmp/gcc-aarch64
-
-          echo "Cloning GCC ARM32 (нужен для compat/vdso32 в 4.19)..."
-          GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git /tmp/gcc-arm
+          ls -la "$CLANG_BIN/clang" "$CLANG_BIN/ld.lld"
 
       - name: Verify Toolchains
         run: |
           export PATH="${{ env.CLANG_BIN }}:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
-          clang --version | head -n 1
-          ld.lld --version | head -n 1
-          /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version | head -n 1
-          /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version | head -n 1
+          # Без пайпов: если clang не запускается — шаг сразу упадёт
+          "${{ env.CLANG_BIN }}/clang" --version
+          "${{ env.CLANG_BIN }}/ld.lld" --version
+          # Реальная тестовая компиляция, чтобы доказать что бинарь исполняется
+          echo 'int main(void){return 0;}' > /tmp/t.c
+          "${{ env.CLANG_BIN }}/clang" /tmp/t.c -o /tmp/t
+          /tmp/t
+          echo "✅ host-компиляция clang работает"
+          /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version
+          /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version
 
       - name: Build Kernel
         run: |
           export PATH="${{ env.CLANG_BIN }}:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
+          TC="${{ env.CLANG_BIN }}"
 
           export ARCH=${KERNEL_ARCH}
           export CROSS_COMPILE="aarch64-linux-android-"
           export CROSS_COMPILE_ARM32="arm-linux-androideabi-"
           export CLANG_TRIPLE="aarch64-linux-gnu-"
 
-          # Ядро 4.19 НЕ понимает 'LLVM=1', поэтому передаём инструменты явно:
-          export CC=clang
-          export LD=ld.lld
-          export AR=llvm-ar
-          export NM=llvm-nm
-          export STRIP=llvm-strip
-          export OBJCOPY=llvm-objcopy
-          export OBJDUMP=llvm-objdump
-          export OBJSIZE=llvm-size
-          export READELF=llvm-readelf
-          # Хостовые утилиты (fixdep и т.д.) тоже собираем LLVM, чтобы не словить elf_x86_64 от GNU ld:
-          export HOSTCC=clang
-          export HOSTCXX=clang++
-          export HOSTLD=ld.lld
-          export HOSTAR=llvm-ar
+          # Абсолютные пути к инструментам — никакого разрешения через PATH,
+          # поэтому 'clang: Permission denied' больше невозможен
+          export CC="$TC/clang"
+          export LD="$TC/ld.lld"
+          export AR="$TC/llvm-ar"
+          export NM="$TC/llvm-nm"
+          export STRIP="$TC/llvm-strip"
+          export OBJCOPY="$TC/llvm-objcopy"
+          export OBJDUMP="$TC/llvm-objdump"
+          export OBJSIZE="$TC/llvm-size"
+          export READELF="$TC/llvm-readelf"
+          export HOSTCC="$TC/clang"
+          export HOSTCXX="$TC/clang++"
+          export HOSTLD="$TC/ld.lld"
+          export HOSTAR="$TC/llvm-ar"
 
           echo "⚙️ Генерация .config из ${KERNEL_DEFCONFIG}..."
           make O=out ARCH=${ARCH} ${KERNEL_DEFCONFIG}
@@ -100,27 +103,22 @@ jobs:
           fi
 
           echo "🚀 Начало компиляции ядра (ClangBuiltLinux ${{ env.LLVM_VERSION }})..."
-          # -fcommon: старый MTK-код содержит tentative definitions, которые новые Clang
-          #           по умолчанию (-fno-common) превращают в multiple definition.
-          # -Wno-unknown-warning-option: игнорируем GCC-only флаги из Makefile'ов драйверов.
-          # -Wno-error=...: понижаем НОВЫЕ дефолтные ошибки Clang до предупреждений,
-          #           чтобы легаси C-код 4.19 компилировался, но сами предупреждения ВИДНЫ.
           make -j$(nproc) \
             O=out \
             ARCH=${ARCH} \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            STRIP=llvm-strip \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            OBJSIZE=llvm-size \
-            READELF=llvm-readelf \
-            HOSTCC=clang \
-            HOSTCXX=clang++ \
-            HOSTLD=ld.lld \
-            HOSTAR=llvm-ar \
+            CC="$TC/clang" \
+            LD="$TC/ld.lld" \
+            AR="$TC/llvm-ar" \
+            NM="$TC/llvm-nm" \
+            STRIP="$TC/llvm-strip" \
+            OBJCOPY="$TC/llvm-objcopy" \
+            OBJDUMP="$TC/llvm-objdump" \
+            OBJSIZE="$TC/llvm-size" \
+            READELF="$TC/llvm-readelf" \
+            HOSTCC="$TC/clang" \
+            HOSTCXX="$TC/clang++" \
+            HOSTLD="$TC/ld.lld" \
+            HOSTAR="$TC/llvm-ar" \
             CLANG_TRIPLE=${CLANG_TRIPLE} \
             CROSS_COMPILE=${CROSS_COMPILE} \
             CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
