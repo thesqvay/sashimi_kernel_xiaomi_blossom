@@ -1261,7 +1261,7 @@ static void nvt_esd_check_func(struct work_struct *work)
         NVT_ERR(
             "[DIAG] irq=%d spi_ok=%d spi_err=%d "
             "esd=%d wdt=%d fw=%d "
-            "last_irq=%lu ms last_spi=%lu ms "
+            "last_irq=%u ms last_spi=%u ms "
             "spi_ret=%d fw_ret=%d "
             "esd_check=%d esd_retry=%d awake=%d irq_enabled=%d trigger=%u\n",
             atomic_read(&nvt_diag_irq_count),
@@ -1391,6 +1391,22 @@ if (unlikely(ret < 0)) {
 atomic_inc(&nvt_diag_spi_ok);
 WRITE_ONCE(nvt_diag_last_spi_ok, jiffies);
 
+/* ===== FULL TOUCH PACKET DIAGNOSTICS ===== */
+
+pr_info("[NVT-DIAG] IRQ=%d GPIO=%d\n",
+        irq, gpio_get_value(ts->irq_gpio));
+
+print_hex_dump(KERN_INFO,
+        "[NVT-PACKET] ",
+        DUMP_PREFIX_OFFSET,
+        16,
+        1,
+        &point_data[1],
+        POINT_DATA_LEN,
+        false);
+
+/* ===== END PACKET DIAGNOSTICS ===== */
+
 #if NVT_TOUCH_WDT_RECOVERY
    /* ESD protect by WDT */
    if (nvt_wdt_fw_recovery(point_data)) {
@@ -1435,8 +1451,25 @@ WRITE_ONCE(nvt_diag_last_spi_ok, jiffies);
 		position = 1 + 6 * i;
 		input_id = (uint8_t) (point_data[position] >> 3);
 
-		if ((input_id == 0) || (input_id > ts->max_touch_num))
-			continue;
+		        pr_info("[NVT-SLOT] slot=%d pos=%u "
+                "raw=%02X %02X %02X %02X %02X %02X "
+                "id=%u state=%u\n",
+                i,
+                position,
+                point_data[position],
+                point_data[position + 1],
+                point_data[position + 2],
+                point_data[position + 3],
+                point_data[position + 4],
+                point_data[position + 5],
+                input_id,
+                point_data[position] & 0x07);
+
+		if ((input_id == 0) || (input_id > ts->max_touch_num)) {
+            pr_info("[NVT-SLOT] REJECT slot=%d invalid_id=%u max=%u\n",
+                    i, input_id, ts->max_touch_num);
+            continue;
+        }
 
 		if (likely(((point_data[position] & 0x07) == 0x01) || ((point_data[position] & 0x07) == 0x02))) {	//finger down (enter & moving)
 #if NVT_TOUCH_ESD_PROTECT
@@ -1445,6 +1478,9 @@ WRITE_ONCE(nvt_diag_last_spi_ok, jiffies);
 #endif /* #if NVT_TOUCH_ESD_PROTECT */
 			input_x = (uint32_t) (point_data[position + 1] << 4) + (uint32_t) (point_data[position + 3] >> 4);
 			input_y = (uint32_t) (point_data[position + 2] << 4) + (uint32_t) (point_data[position + 3] & 0x0F);
+
+			            pr_info("[NVT-SLOT] ACCEPT slot=%d id=%u x=%u y=%u\n",
+                    i, input_id, input_x, input_y);
 
 #if MT_PROTOCOL_B
 			press_id[input_id - 1] = 1;
@@ -1501,6 +1537,11 @@ WRITE_ONCE(nvt_diag_last_spi_ok, jiffies);
 #endif
 
 	input_sync(ts->input_dev);
+
+	pr_info("[NVT-PARSE] IRQ=%d fingers=%d BTN_TOUCH=%d\n",
+        irq,
+        finger_cnt,
+        finger_cnt > 0);
 
 XFER_ERROR:
 

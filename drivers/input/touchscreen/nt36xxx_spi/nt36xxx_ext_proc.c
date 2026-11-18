@@ -128,22 +128,37 @@ Description:
 return:
 	n.a.
 *******************************************************/
-void nvt_read_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
+int32_t nvt_read_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
 {
-	int32_t i = 0;
-	int32_t j = 0;
-	int32_t k = 0;
-	uint8_t buf[SPI_TANSFER_LENGTH + 1] = {0};
-	uint32_t head_addr = 0;
-	int32_t dummy_len = 0;
-	int32_t data_len = 0;
-	int32_t residual_len = 0;
+    int32_t i = 0;
+    int32_t j = 0;
+    int32_t k = 0;
+    int32_t ret = 0;
+
+    uint8_t buf[SPI_TANSFER_LENGTH + 1] = {0};
+    uint32_t head_addr = 0;
+    uint32_t dummy_len = 0;
+    uint32_t data_len = 0;
+    uint32_t residual_len = 0;
+    uint32_t total_len = 0;
 
 	//---set xdata sector address & length---
 	head_addr = xdata_addr - (xdata_addr % XDATA_SECTOR_SIZE);
 	dummy_len = xdata_addr - head_addr;
 	data_len = ts->x_num * ts->y_num * 2;
 	residual_len = (head_addr + dummy_len + data_len) % XDATA_SECTOR_SIZE;
+
+	total_len = dummy_len + data_len;
+
+if (!ts->x_num || !ts->y_num ||
+    (uint64_t)ts->x_num * ts->y_num * 2 >
+    sizeof(xdata_tmp) ||
+    ((total_len + XDATA_SECTOR_SIZE - 1) /
+     XDATA_SECTOR_SIZE * XDATA_SECTOR_SIZE) >
+    sizeof(xdata_tmp)) {
+    pr_err("[NVT-DIAG] Invalid mdata dimensions or buffer size\n");
+    return -EINVAL;
+}
 
 	//printk("head_addr=0x%05X, dummy_len=0x%05X, data_len=0x%05X, residual_len=0x%05X\n", head_addr, dummy_len, data_len, residual_len);
 
@@ -374,38 +389,47 @@ return:
 *******************************************************/
 static int32_t nvt_baseline_open(struct inode *inode, struct file *file)
 {
-	if (mutex_lock_interruptible(&ts->lock)) {
+	int ret = -EAGAIN;
+	bool test_mode = false;
+
+	if (mutex_lock_interruptible(&ts->lock))
 		return -ERESTARTSYS;
-	}
 
 	NVT_LOG("++\n");
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	if (nvt_clear_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_clear_fw_status())
+		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
+	test_mode = true;
 
-	if (nvt_check_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_check_fw_status())
+		goto out;
 
-	if (nvt_get_fw_info()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_get_fw_info())
+		goto out;
 
-	nvt_read_mdata(ts->mmap->BASELINE_ADDR, ts->mmap->BASELINE_BTN_ADDR);
+	nvt_read_mdata(ts->mmap->BASELINE_ADDR,
+		       ts->mmap->BASELINE_BTN_ADDR);
 
-	nvt_change_mode(NORMAL_MODE);
+	ret = 0;
+
+out:
+	if (test_mode)
+		nvt_change_mode(NORMAL_MODE);
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
+
+	if (ret)
+		return ret;
 
 	NVT_LOG("--\n");
 
@@ -429,41 +453,51 @@ return:
 *******************************************************/
 static int32_t nvt_raw_open(struct inode *inode, struct file *file)
 {
-	if (mutex_lock_interruptible(&ts->lock)) {
+	int ret = -EAGAIN;
+	bool test_mode = false;
+
+	if (mutex_lock_interruptible(&ts->lock))
 		return -ERESTARTSYS;
-	}
 
 	NVT_LOG("++\n");
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	if (nvt_clear_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_clear_fw_status())
+		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
+	test_mode = true;
 
-	if (nvt_check_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_check_fw_status())
+		goto out;
 
-	if (nvt_get_fw_info()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_get_fw_info())
+		goto out;
 
 	if (nvt_get_fw_pipe() == 0)
-		nvt_read_mdata(ts->mmap->RAW_PIPE0_ADDR, ts->mmap->RAW_BTN_PIPE0_ADDR);
+		nvt_read_mdata(ts->mmap->RAW_PIPE0_ADDR,
+			       ts->mmap->RAW_BTN_PIPE0_ADDR);
 	else
-		nvt_read_mdata(ts->mmap->RAW_PIPE1_ADDR, ts->mmap->RAW_BTN_PIPE1_ADDR);
+		nvt_read_mdata(ts->mmap->RAW_PIPE1_ADDR,
+			       ts->mmap->RAW_BTN_PIPE1_ADDR);
 
-	nvt_change_mode(NORMAL_MODE);
+	ret = 0;
+
+out:
+	if (test_mode)
+		nvt_change_mode(NORMAL_MODE);
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
+
+	if (ret)
+		return ret;
 
 	NVT_LOG("--\n");
 
@@ -487,41 +521,51 @@ return:
 *******************************************************/
 static int32_t nvt_diff_open(struct inode *inode, struct file *file)
 {
-	if (mutex_lock_interruptible(&ts->lock)) {
+	int ret = -EAGAIN;
+	bool test_mode = false;
+
+	if (mutex_lock_interruptible(&ts->lock))
 		return -ERESTARTSYS;
-	}
 
 	NVT_LOG("++\n");
 
 #if NVT_TOUCH_ESD_PROTECT
 	nvt_esd_check_enable(false);
-#endif /* #if NVT_TOUCH_ESD_PROTECT */
+#endif
 
-	if (nvt_clear_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_clear_fw_status())
+		goto out;
 
 	nvt_change_mode(TEST_MODE_2);
+	test_mode = true;
 
-	if (nvt_check_fw_status()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_check_fw_status())
+		goto out;
 
-	if (nvt_get_fw_info()) {
-		mutex_unlock(&ts->lock);
-		return -EAGAIN;
-	}
+	if (nvt_get_fw_info())
+		goto out;
 
 	if (nvt_get_fw_pipe() == 0)
-		nvt_read_mdata(ts->mmap->DIFF_PIPE0_ADDR, ts->mmap->DIFF_BTN_PIPE0_ADDR);
+		nvt_read_mdata(ts->mmap->DIFF_PIPE0_ADDR,
+			       ts->mmap->DIFF_BTN_PIPE0_ADDR);
 	else
-		nvt_read_mdata(ts->mmap->DIFF_PIPE1_ADDR, ts->mmap->DIFF_BTN_PIPE1_ADDR);
+		nvt_read_mdata(ts->mmap->DIFF_PIPE1_ADDR,
+			       ts->mmap->DIFF_BTN_PIPE1_ADDR);
 
-	nvt_change_mode(NORMAL_MODE);
+	ret = 0;
+
+out:
+	if (test_mode)
+		nvt_change_mode(NORMAL_MODE);
+
+#if NVT_TOUCH_ESD_PROTECT
+	nvt_esd_check_enable(true);
+#endif
 
 	mutex_unlock(&ts->lock);
+
+	if (ret)
+		return ret;
 
 	NVT_LOG("--\n");
 
@@ -591,7 +635,7 @@ Description:
 return:
 	n.a.
 *******************************************************/
-void nvt_read_diff_mdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
+void ad_diff_nvt_remdata(uint32_t xdata_addr, uint32_t xdata_btn_addr)
 {
 	int32_t i = 0;
 	int32_t j = 0;
