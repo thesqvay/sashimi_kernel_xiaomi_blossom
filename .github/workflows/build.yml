@@ -62,6 +62,7 @@ jobs:
 
           git config --global url."https://".insteadOf git://
 
+      
       - name: Download LLVM Toolchain
         run: |
           set -euo pipefail
@@ -78,21 +79,15 @@ jobs:
 
           tar -xJf "$LLVM_ARCHIVE" -C /tmp/clang-tc
 
-          CLANG_BIN=""
+          CLANG_BIN="/tmp/clang-tc/llvm-${LLVM_VERSION}-x86_64/bin"
 
-          while IFS= read -r clang_path; do
-            candidate_dir="$(dirname "$clang_path")"
+          if [ ! -x "$CLANG_BIN/clang" ]; then
+            echo "ERROR: Clang not found!"
+            exit 1
+          fi
 
-            if [ -x "$candidate_dir/clang" ] &&
-               [ -x "$candidate_dir/ld.lld" ]; then
-              CLANG_BIN="$candidate_dir"
-              break
-            fi
-          done < <(find /tmp/clang-tc -type f -name clang -executable)
-
-          if [ -z "$CLANG_BIN" ]; then
-            echo "ERROR: Clang or LLD not found!"
-            find /tmp/clang-tc -maxdepth 4 -print
+          if [ ! -x "$CLANG_BIN/ld.lld" ]; then
+            echo "ERROR: LLD not found!"
             exit 1
           fi
 
