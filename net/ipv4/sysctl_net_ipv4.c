@@ -50,8 +50,10 @@ static int ip_ping_group_range_max[] = { GID_T_MAX, GID_T_MAX };
 static int comp_sack_nr_max = 255;
 static u32 u32_max_div_HZ = UINT_MAX / HZ;
 static int one_day_secs = 24 * 3600;
-
-static int tcp_min_rcvbuf = 4096;
+static int tcp_delack_seg_min = TCP_DELACK_MIN;
+static int tcp_delack_seg_max = 60;
+static int tcp_use_userconfig_min;
+static int tcp_use_userconfig_max = 1;
 
 /* obsolete */
 static int sysctl_tcp_low_latency __read_mostly;
@@ -863,9 +865,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.data		= &init_net.ipv4.sysctl_tcp_reordering,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one,
-		.extra2		= &init_net.ipv4.sysctl_tcp_max_reordering,
+		.proc_handler	= proc_dointvec
 	},
 	{
 		.procname	= "tcp_retries1",
@@ -1077,8 +1077,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.data		= &init_net.ipv4.sysctl_tcp_max_reordering,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &one,
+		.proc_handler	= proc_dointvec
 	},
 	{
 		.procname	= "tcp_dsack",
@@ -1218,7 +1217,7 @@ static struct ctl_table ipv4_net_table[] = {
 		.maxlen		= sizeof(init_net.ipv4.sysctl_tcp_rmem),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_minmax,
-		.extra1		= &tcp_min_rcvbuf,
+		.extra1		= SYSCTL_ONE,
 	},
 	{
 		.procname	= "tcp_comp_sack_delay_ns",
@@ -1268,12 +1267,8 @@ static __net_init int ipv4_sysctl_init_net(struct net *net)
 			goto err_alloc;
 
 		/* Update the variables to point into the current struct net */
-		for (i = 0; i < ARRAY_SIZE(ipv4_net_table) - 1; i++) {
+		for (i = 0; i < ARRAY_SIZE(ipv4_net_table) - 1; i++)
 			table[i].data += (void *)net - (void *)&init_net;
-			if (table[i].extra2 >= (void *)&init_net.ipv4 &&
-			    table[i].extra2 < (void *)(&init_net.ipv4 + 1))
-				table[i].extra2 += (void *)net - (void *)&init_net;
-		}
 	}
 
 	net->ipv4.ipv4_hdr = register_net_sysctl(net, "net/ipv4", table);

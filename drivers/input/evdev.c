@@ -151,16 +151,7 @@ static void __evdev_queue_syn_dropped(struct evdev_client *client)
 	ktime_t *ev_time = input_get_timestamp(client->evdev->handle.dev);
 	struct timespec64 ts = ktime_to_timespec64(ev_time[client->clk_type]);
 	struct input_event ev;
-	ktime_t time;
-	struct timespec64 ts;
 
-	time = client->clk_type == EV_CLK_REAL ?
-			ktime_get_real() :
-			client->clk_type == EV_CLK_MONO ?
-				ktime_get() :
-				ktime_get_boottime();
-
-	ts = ktime_to_timespec64(time);
 	memset(&ev, 0, sizeof(ev));
 	ev.input_event_sec = ts.tv_sec;
 	ev.input_event_usec = ts.tv_nsec / NSEC_PER_USEC;
@@ -171,7 +162,6 @@ static void __evdev_queue_syn_dropped(struct evdev_client *client)
 	client->head &= client->bufsize - 1;
 
 	if (unlikely(client->head == client->tail)) {
-		/* drop queue but keep our SYN_DROPPED event */
 		client->tail = (client->head - 1) & (client->bufsize - 1);
 		client->packet_head = client->tail;
 	}
