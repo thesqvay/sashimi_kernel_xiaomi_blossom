@@ -1,7 +1,11 @@
+
 name: Build Sashimi Kernel (blossom)
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   KERNEL_DEFCONFIG: blossom_defconfig
@@ -18,61 +22,142 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          sudo apt-get install -y bc bison flex build-essential libssl-dev libelf-dev cpio kmod git zip curl ca-certificates jq \
-            wget xz-utils libffi-dev zlib1g-dev libreadline-dev libsqlite3-dev libbz2-dev libncurses5-dev libgdbm-dev liblzma-dev tk-dev python3 python-is-python3
+          set -euo pipefail
 
-      - name: Configure git
+          export DEBIAN_FRONTEND=noninteractive
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            bc \
+            bison \
+            flex \
+            build-essential \
+            libssl-dev \
+            libelf-dev \
+            cpio \
+            kmod \
+            git \
+            zip \
+            curl \
+            ca-certificates \
+            jq \
+            wget \
+            xz-utils \
+            libffi-dev \
+            zlib1g-dev \
+            libreadline-dev \
+            libsqlite3-dev \
+            libbz2-dev \
+            libncurses5-dev \
+            libgdbm-dev \
+            liblzma-dev \
+            tk-dev \
+            python3 \
+            python-is-python3
+
+      - name: Configure Git
         run: |
-          git config --global http.sslVerify false
+          set -euo pipefail
+
           git config --global url."https://".insteadOf git://
 
-      - name: Download ClangBuiltLinux Toolchain (Clang + LLD)
+      - name: Download LLVM Toolchain
         run: |
-          echo "Downloading ClangBuiltLinux ${{ env.LLVM_VERSION }} ..."
+          set -euo pipefail
+
+          echo "Downloading LLVM $LLVM_VERSION..."
+
           mkdir -p /tmp/clang-tc
-          curl -LSs "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${{ env.LLVM_VERSION }}-x86_64.tar.xz" \
-            | tar -xJ -C /tmp/clang-tc
+
+          LLVM_ARCHIVE="/tmp/llvm-${LLVM_VERSION}.tar.xz"
+
+          curl -fL --retry 3 --retry-delay 2 \
+            "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${LLVM_VERSION}-x86_64.tar.xz" \
+            -o "$LLVM_ARCHIVE"
+
+          tar -xJf "$LLVM_ARCHIVE" -C /tmp/clang-tc
 
           CLANG_BIN=""
-          for c in $(find /tmp/clang-tc \( -type f -o -type l \) -name clang -perm -u+x); do
-            d=$(dirname "$c")
-            if [ -e "$d/ld.lld" ]; then CLANG_BIN="$d"; break; fi
-          done
+
+          while IFS= read -r clang_path; do
+            candidate_dir="$(dirname "$clang_path")"
+
+            if [ -x "$candidate_dir/clang" ] &&
+               [ -x "$candidate_dir/ld.lld" ]; then
+              CLANG_BIN="$candidate_dir"
+              break
+            fi
+          done < <(find /tmp/clang-tc -type f -name clang -executable)
+
           if [ -z "$CLANG_BIN" ]; then
-            echo "❌ Не найден исполняемый clang рядом с ld.lld!"
-            find /tmp/clang-tc -maxdepth 3 | head -n 40
+            echo "ERROR: Clang or LLD not found!"
+            find /tmp/clang-tc -maxdepth 4 -print
             exit 1
           fi
-          chmod -R u+rx "$CLANG_BIN"
-          echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
-          echo "✅ Clang bin: $CLANG_BIN"
-          ls -la "$CLANG_BIN/clang" "$CLANG_BIN/ld.lld"
 
-      - name: Clone LineageOS GCC toolchains
+          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
+
+          echo "LLVM directory: $CLANG_BIN"
+
+          "$CLANG_BIN/clang" --version
+          "$CLANG_BIN/ld.lld" --version
+
+      - name: Clone LineageOS GCC Toolchains
         run: |
+          set -euo pipefail
+
           echo "Cloning GCC ARM64..."
-          GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git /tmp/gcc-aarch64
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
+            /tmp/gcc-aarch64
+
           echo "Cloning GCC ARM32..."
-          GIT_SSL_NO_VERIFY=1 git clone --depth=1 https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git /tmp/gcc-arm
+
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
+            /tmp/gcc-arm
+
+          echo "Both GCC toolchains downloaded successfully."
 
       - name: Verify Toolchains
         run: |
-          "${{ env.CLANG_BIN }}/clang" --version
-          "${{ env.CLANG_BIN }}/ld.lld" --version
-          echo 'int main(void){return 0;}' > /tmp/t.c
-          "${{ env.CLANG_BIN }}/clang" /tmp/t.c -o /tmp/t && /tmp/t
-          echo "✅ host-компиляция clang работает"
+          set -euo pipefail
+
+          echo "Checking Clang..."
+
+          "$CLANG_BIN/clang" --version
+          "$CLANG_BIN/ld.lld" --version
+
+          echo "Checking host compilation..."
+
+          printf 'int main(void) { return 0; }\n' > /tmp/test.c
+
+          "$CLANG_BIN/clang" /tmp/test.c -o /tmp/test
+          /tmp/test
+
+          echo "Host Clang compilation successful."
+
+          echo "Checking GCC ARM64..."
+
           /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version
+
+          echo "Checking GCC ARM32..."
+
           /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version
+
+          echo "All toolchains are available."
 
       - name: Build Kernel
         run: |
-          export PATH="${{ env.CLANG_BIN }}:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:${PATH}"
-          TC="${{ env.CLANG_BIN }}"
+          set -euo pipefail
 
-          export ARCH=${KERNEL_ARCH}
+          export PATH="$CLANG_BIN:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:$PATH"
+
+          TC="$CLANG_BIN"
+
+          export ARCH="$KERNEL_ARCH"
           export CROSS_COMPILE="aarch64-linux-android-"
           export CROSS_COMPILE_ARM32="arm-linux-androideabi-"
           export CLANG_TRIPLE="aarch64-linux-gnu-"
@@ -86,79 +171,138 @@ jobs:
           export OBJDUMP="$TC/llvm-objdump"
           export OBJSIZE="$TC/llvm-size"
           export READELF="$TC/llvm-readelf"
+
           export HOSTCC="$TC/clang"
           export HOSTCXX="$TC/clang++"
           export HOSTLD="$TC/ld.lld"
           export HOSTAR="$TC/llvm-ar"
 
-          echo "⚙️ Генерация .config из ${KERNEL_DEFCONFIG}..."
-          make O=out ARCH=${ARCH} ${KERNEL_DEFCONFIG}
+          echo "======================================"
+          echo " Sashimi Kernel Build"
+          echo " Architecture: $ARCH"
+          echo " Defconfig: $KERNEL_DEFCONFIG"
+          echo " LLVM: $LLVM_VERSION"
+          echo "======================================"
 
-          echo "🔍 Проверка наличия KernelSU в сгенерированном .config..."
-          if grep -q "CONFIG_KSU=y" out/.config && grep -q "CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
-            echo "✅ KernelSU успешно активирован в конфиге!"
-          else
-            echo "⚠️ ВНИМАНИЕ: KernelSU отсутствует или отключен в .config."
+          echo "Generating kernel configuration..."
+
+          make O=out ARCH="$ARCH" "$KERNEL_DEFCONFIG"
+
+          if [ ! -s out/.config ]; then
+            echo "ERROR: Kernel configuration was not generated!"
+            exit 1
           fi
 
-          echo "🚀 Начало компиляции ядра (ClangBuiltLinux ${{ env.LLVM_VERSION }})..."
-          make -j$(nproc) \
+          echo "Checking KernelSU configuration..."
+
+          if grep -q '^CONFIG_KSU=y$' out/.config &&
+             grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
+            echo "KernelSU is enabled."
+          else
+            echo "WARNING: KernelSU or Manual Hook is not enabled."
+          fi
+
+          echo "Starting kernel compilation..."
+
+          make -j"$(nproc)" \
             O=out \
-            ARCH=${ARCH} \
-            CC="$TC/clang" \
-            LD="$TC/ld.lld" \
-            AR="$TC/llvm-ar" \
-            NM="$TC/llvm-nm" \
-            STRIP="$TC/llvm-strip" \
-            OBJCOPY="$TC/llvm-objcopy" \
-            OBJDUMP="$TC/llvm-objdump" \
-            OBJSIZE="$TC/llvm-size" \
-            READELF="$TC/llvm-readelf" \
-            HOSTCC="$TC/clang" \
-            HOSTCXX="$TC/clang++" \
-            HOSTLD="$TC/ld.lld" \
-            HOSTAR="$TC/llvm-ar" \
-            CLANG_TRIPLE=${CLANG_TRIPLE} \
-            CROSS_COMPILE=${CROSS_COMPILE} \
-            CROSS_COMPILE_ARM32=${CROSS_COMPILE_ARM32} \
+            ARCH="$ARCH" \
+            CC="$CC" \
+            LD="$LD" \
+            AR="$AR" \
+            NM="$NM" \
+            STRIP="$STRIP" \
+            OBJCOPY="$OBJCOPY" \
+            OBJDUMP="$OBJDUMP" \
+            OBJSIZE="$OBJSIZE" \
+            READELF="$READELF" \
+            HOSTCC="$HOSTCC" \
+            HOSTCXX="$HOSTCXX" \
+            HOSTLD="$HOSTLD" \
+            HOSTAR="$HOSTAR" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             KCFLAGS="-fcommon -Wno-unknown-warning-option -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types" \
             2>&1 | tee build.log
 
-     - name: Verify Output
-  run: |
-    echo "🔎 Содержимое каталога ядра:"
-    find out/arch/${KERNEL_ARCH}/boot -maxdepth 2 -type f -printf '%p (%s bytes)\n'
+          echo "Kernel compilation finished successfully."
+          
+      - name: Verify Output
+        run: |
+          set -euo pipefail
 
-    echo "🔎 Поиск скомпилированного образа ядра..."
+          BOOT_DIR="out/arch/${KERNEL_ARCH}/boot"
 
-    if [ -s "out/arch/${KERNEL_ARCH}/boot/Image.gz-dtb" ]; then
-      echo "KERNEL_IMAGE=Image.gz-dtb" >> $GITHUB_ENV
-    elif [ -s "out/arch/${KERNEL_ARCH}/boot/Image.gz" ]; then
-      echo "KERNEL_IMAGE=Image.gz" >> $GITHUB_ENV
-    elif [ -s "out/arch/${KERNEL_ARCH}/boot/Image" ]; then
-      echo "KERNEL_IMAGE=Image" >> $GITHUB_ENV
-    else
-      echo "❌ Образ ядра не найден!"
-      echo "Проверяем наличие vmlinux:"
-      ls -lh out/vmlinux || true
-      exit 1
-    fi
+          echo "Checking kernel output directory..."
 
-    echo "✅ Найден образ: $KERNEL_IMAGE"
+          if [ -d "$BOOT_DIR" ]; then
+            find "$BOOT_DIR" -maxdepth 3 -type f \
+              -printf '%p (%s bytes)\n'
+          else
+            echo "ERROR: Boot directory does not exist!"
+            exit 1
+          fi
+
+          echo "Searching for kernel image..."
+
+          if [ -s "$BOOT_DIR/Image.gz-dtb" ]; then
+            KERNEL_IMAGE="Image.gz-dtb"
+
+          elif [ -s "$BOOT_DIR/Image.gz" ]; then
+            KERNEL_IMAGE="Image.gz"
+
+          elif [ -s "$BOOT_DIR/Image" ]; then
+            KERNEL_IMAGE="Image"
+
+          else
+            echo "ERROR: Kernel image not found!"
+
+            echo "Checking vmlinux..."
+
+            ls -lh out/vmlinux || true
+
+            echo "Checking build log..."
+
+            tail -n 100 build.log || true
+
+            exit 1
+          fi
+
+          echo "KERNEL_IMAGE=$KERNEL_IMAGE" >> "$GITHUB_ENV"
+
+          echo "Kernel image found: $KERNEL_IMAGE"
 
       - name: Package AnyKernel3 Flashable ZIP
+        id: package
         run: |
-          git clone -b nadeko --depth=1 https://github.com/dre698/AnyKernel3.git anykernel
-          cd anykernel
-          rm -f zImage Image.gz Image.gz-dtb *.dtb
+          set -euo pipefail
 
-          if [ -f "../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb" ]; then
-            cp ../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb Image.gz-dtb
-            echo "✓ Скопирован Image.gz-dtb"
-          elif [ -f "../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz" ]; then
-            cp ../out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz Image.gz
-            echo "✓ Скопирован Image.gz"
+          echo "Cloning AnyKernel3..."
+
+          git clone --depth=1 -b nadeko \
+            https://github.com/dre698/AnyKernel3.git \
+            anykernel
+
+          cd anykernel
+
+          echo "Cleaning existing kernel images..."
+
+          rm -f zImage Image Image.gz Image.gz-dtb
+
+          echo "Copying compiled kernel image..."
+
+          cp "../out/arch/${KERNEL_ARCH}/boot/${KERNEL_IMAGE}" \
+            "$KERNEL_IMAGE"
+
+          if [ ! -s "$KERNEL_IMAGE" ]; then
+            echo "ERROR: Kernel image copy failed!"
+            exit 1
           fi
+
+          echo "Using kernel image: $KERNEL_IMAGE"
+
+          echo "Configuring AnyKernel3..."
 
           cat > anykernel.sh << 'EOF'
           properties() { '
@@ -175,33 +319,54 @@ jobs:
           device.name5=cattail
           device.name6=angelicain
           '; }
+
           BLOCK=auto;
           IS_SLOT_DEVICE=0;
           RAMDISK_COMPRESSION=auto;
+
           . tools/ak3-core.sh;
+
           dump_boot;
           write_boot;
           EOF
 
-          rm -rf .git README.md .github *placeholder*
-          ZIP_NAME="Sashimi-Kernel-blossom-$(date +%y%m%d-%H%M).zip"
-          zip -r9 "../$ZIP_NAME" *
-          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+          echo "Removing unnecessary files..."
 
-      - name: Upload Flashable ZIP (Для прошивки)
+          rm -rf .git README.md .github *placeholder*
+
+          ZIP_NAME="Sashimi-Kernel-blossom-$(date -u +%y%m%d-%H%M).zip"
+
+          echo "Creating flashable ZIP: $ZIP_NAME"
+
+          zip -r9 "../$ZIP_NAME" .
+
+          if [ ! -s "../$ZIP_NAME" ]; then
+            echo "ERROR: ZIP archive was not created!"
+            exit 1
+          fi
+
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Package created successfully."
+
+      - name: Upload Flashable ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          name: ${{ steps.package.outputs.ZIP_NAME }}
+          path: ${{ steps.package.outputs.ZIP_NAME }}
+          if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Raw Files (Для отладки)
+      - name: Upload Raw Kernel Files
         uses: actions/upload-artifact@v4
         with:
           name: raw-kernel-files
           path: |
-            out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz-dtb
-            out/arch/${{ env.KERNEL_ARCH }}/boot/Image.gz
+            out/arch/arm64/boot/Image
+            out/arch/arm64/boot/Image.gz
+            out/arch/arm64/boot/Image.gz-dtb
+            out/vmlinux
             out/.config
             build.log
+          if-no-files-found: error
           retention-days: 7
