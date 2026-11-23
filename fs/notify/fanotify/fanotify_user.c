@@ -570,16 +570,28 @@ static int fanotify_remove_inode_mark(struct fsnotify_group *group,
 				    flags);
 }
 
-static __u32 fanotify_mark_add_to_mask(struct fsnotify_mark *fsn_mark,
-				       __u32 mask,
-				       unsigned int flags)
+static bool fanotify_mark_add_to_mask(struct fsnotify_mark *fsn_mark,
+				      __u32 mask,
+				      unsigned int flags)
 {
-	__u32 oldmask = -1;
+	bool recalc = false;
 
 	spin_lock(&fsn_mark->lock);
 	if (!(flags & FAN_MARK_IGNORED_MASK)) {
-		oldmask = fsn_mark->mask;
-		fsn_mark->mask |= mask;
+		__u32 tmask = fsn_mark->mask | mask;
+
+		if (flags & FAN_MARK_ONDIR)
+			tmask |= FAN_ONDIR;
+
+		/*
+		 * Testing the cached object mask for the added bits is racy
+		 * with recalculation triggered by an update of another mark
+		 * on the same object, which may have observed this mark
+		 * before the bit was added.  Recalculate whenever this mark's
+		 * mask changed.
+		 */
+		recalc = tmask != fsn_mark->mask;
+		fsn_mark->mask = tmask;
 	} else {
 		fsn_mark->ignored_mask |= mask;
 		if (flags & FAN_MARK_IGNORED_SURV_MODIFY)
@@ -587,7 +599,7 @@ static __u32 fanotify_mark_add_to_mask(struct fsnotify_mark *fsn_mark,
 	}
 	spin_unlock(&fsn_mark->lock);
 
-	return mask & ~oldmask;
+	return recalc;
 }
 
 static struct fsnotify_mark *fanotify_add_new_mark(struct fsnotify_group *group,
@@ -620,7 +632,6 @@ static int fanotify_add_mark(struct fsnotify_group *group,
 			     __u32 mask, unsigned int flags)
 {
 	struct fsnotify_mark *fsn_mark;
-	__u32 added;
 
 	mutex_lock(&group->mark_mutex);
 	fsn_mark = fsnotify_find_mark(connp, group);
@@ -631,8 +642,7 @@ static int fanotify_add_mark(struct fsnotify_group *group,
 			return PTR_ERR(fsn_mark);
 		}
 	}
-	added = fanotify_mark_add_to_mask(fsn_mark, mask, flags);
-	if (added & ~fsnotify_conn_mask(fsn_mark->connector))
+	if (fanotify_mark_add_to_mask(fsn_mark, mask, flags))
 		fsnotify_recalc_mask(fsn_mark->connector);
 	mutex_unlock(&group->mark_mutex);
 
