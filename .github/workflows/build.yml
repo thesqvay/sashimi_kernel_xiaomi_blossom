@@ -124,17 +124,27 @@ jobs:
             KCFLAGS="-fcommon -Wno-unknown-warning-option -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types" \
             2>&1 | tee build.log
 
-      - name: Verify Output
-        run: |
-          echo "🔎 Поиск скомпилированного образа ядра..."
-          if [ -f "out/arch/${KERNEL_ARCH}/boot/Image.gz-dtb" ]; then
-            echo "✅ Успешно собран: Image.gz-dtb"
-          elif [ -f "out/arch/${KERNEL_ARCH}/boot/Image.gz" ]; then
-            echo "✅ Успешно собран: Image.gz"
-          else
-            echo "❌ Образ ядра не найден! Проверь build.log"
-            exit 1
-          fi
+     - name: Verify Output
+  run: |
+    echo "🔎 Содержимое каталога ядра:"
+    find out/arch/${KERNEL_ARCH}/boot -maxdepth 2 -type f -printf '%p (%s bytes)\n'
+
+    echo "🔎 Поиск скомпилированного образа ядра..."
+
+    if [ -s "out/arch/${KERNEL_ARCH}/boot/Image.gz-dtb" ]; then
+      echo "KERNEL_IMAGE=Image.gz-dtb" >> $GITHUB_ENV
+    elif [ -s "out/arch/${KERNEL_ARCH}/boot/Image.gz" ]; then
+      echo "KERNEL_IMAGE=Image.gz" >> $GITHUB_ENV
+    elif [ -s "out/arch/${KERNEL_ARCH}/boot/Image" ]; then
+      echo "KERNEL_IMAGE=Image" >> $GITHUB_ENV
+    else
+      echo "❌ Образ ядра не найден!"
+      echo "Проверяем наличие vmlinux:"
+      ls -lh out/vmlinux || true
+      exit 1
+    fi
+
+    echo "✅ Найден образ: $KERNEL_IMAGE"
 
       - name: Package AnyKernel3 Flashable ZIP
         run: |
