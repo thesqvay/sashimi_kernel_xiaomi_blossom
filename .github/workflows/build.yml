@@ -61,7 +61,7 @@ jobs:
           sed -i 's/^OPT_FLAGS[[:space:]]*:=.*$/OPT_FLAGS := -O2 -march=armv8-a+crc+crypto/' Makefile
           grep -n "OPT_FLAGS" Makefile
 
-            - name: Build Kernel
+      - name: Build Kernel
         run: |
           set -euo pipefail
           export PATH="/tmp/proton-clang/bin:$PATH"
