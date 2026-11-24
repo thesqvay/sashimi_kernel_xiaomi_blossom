@@ -9,7 +9,7 @@ permissions:
 env:
   KERNEL_DEFCONFIG: blossom_defconfig
   KERNEL_ARCH: arm64
-  LLVM_VERSION: "23.1.0"
+  CCACHE_DIR: /home/runner/.ccache
 
 jobs:
   build:
@@ -28,10 +28,7 @@ jobs:
           git submodule update --init --recursive
           git -C KernelSU fetch --tags --force
           git -C KernelSU checkout v4.2.0-rc3
-          if [ ! -f drivers/kernelsu/Kconfig ]; then
-            echo "ERROR: drivers/kernelsu/Kconfig not found (submodule/symlink broken)!"
-            exit 1
-          fi
+          test -f drivers/kernelsu/Kconfig || { echo "ERROR: kernelsu Kconfig missing"; exit 1; }
           echo "KernelSU at: $(git -C KernelSU rev-parse --short HEAD)"
 
       - name: Install Dependencies
@@ -39,125 +36,78 @@ jobs:
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison flex build-essential libssl-dev libelf-dev cpio kmod \
-            git zip curl ca-certificates jq wget xz-utils libffi-dev zlib1g-dev \
-            libreadline-dev libsqlite3-dev libbz2-dev libncurses5-dev libgdbm-dev \
-            liblzma-dev tk-dev python3 python-is-python3
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex build-essential libssl-dev libelf-dev cpio \
+            git zip curl ca-certificates xz-utils ccache python3
 
-      - name: Configure Git
+      - name: Clone Proton Clang
         run: |
           set -euo pipefail
-          git config --global url."https://".insteadOf git://
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git /tmp/proton-clang
+          /tmp/proton-clang/bin/clang --version
+          /tmp/proton-clang/bin/ld.lld --version
 
-      - name: Download LLVM Toolchain
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.ccache
+          key: ccache-${{ runner.os }}-${{ github.ref_name }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-${{ github.ref_name }}-
+
+      - name: Set -O2 optimization
         run: |
           set -euo pipefail
-          echo "Downloading LLVM $LLVM_VERSION..."
-          mkdir -p /tmp/clang-tc
-          LLVM_ARCHIVE="/tmp/llvm-${LLVM_VERSION}.tar.xz"
-          curl -fL --retry 3 --retry-delay 2 \
-            "https://mirrors.edge.kernel.org/pub/tools/llvm/files/llvm-${LLVM_VERSION}-x86_64.tar.xz" \
-            -o "$LLVM_ARCHIVE"
-          tar -xJf "$LLVM_ARCHIVE" -C /tmp/clang-tc
-          CLANG_BIN="/tmp/clang-tc/llvm-${LLVM_VERSION}-x86_64/bin"
-          if [ ! -x "$CLANG_BIN/clang" ]; then echo "ERROR: Clang not found!"; exit 1; fi
-          if [ ! -x "$CLANG_BIN/ld.lld" ]; then echo "ERROR: LLD not found!"; exit 1; fi
-          echo "CLANG_BIN=$CLANG_BIN" >> "$GITHUB_ENV"
-          "$CLANG_BIN/clang" --version
-          "$CLANG_BIN/ld.lld" --version
-
-      - name: Clone LineageOS GCC Toolchains
-        run: |
-          set -euo pipefail
-          git clone --depth=1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
-            /tmp/gcc-aarch64
-          git clone --depth=1 \
-            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9.git \
-            /tmp/gcc-arm
-
-      - name: Verify Toolchains
-        run: |
-          set -euo pipefail
-          "$CLANG_BIN/clang" --version
-          "$CLANG_BIN/ld.lld" --version
-          printf 'int main(void) { return 0; }\n' > /tmp/test.c
-          "$CLANG_BIN/clang" /tmp/test.c -o /tmp/test
-          /tmp/test
-          /tmp/gcc-aarch64/bin/aarch64-linux-android-gcc --version
-          /tmp/gcc-arm/bin/arm-linux-androideabi-gcc --version
+          sed -i 's/^OPT_FLAGS[[:space:]]*:=.*$/OPT_FLAGS := -O2 -march=armv8-a+crc+crypto/' Makefile
+          grep -n "OPT_FLAGS" Makefile
 
       - name: Build Kernel
         run: |
           set -euo pipefail
-          export PATH="$CLANG_BIN:/tmp/gcc-aarch64/bin:/tmp/gcc-arm/bin:$PATH"
-          TC="$CLANG_BIN"
+          export PATH="/tmp/proton-clang/bin:$PATH"
           export ARCH="$KERNEL_ARCH"
-          export CROSS_COMPILE="aarch64-linux-android-"
-          export CROSS_COMPILE_ARM32="arm-linux-androideabi-"
+          export CROSS_COMPILE="aarch64-linux-gnu-"
+          export CROSS_COMPILE_ARM32="arm-linux-gnueabi-"
           export CLANG_TRIPLE="aarch64-linux-gnu-"
-          export CC="$TC/clang"
-          export LD="$TC/ld.lld"
-          export AR="$TC/llvm-ar"
-          export NM="$TC/llvm-nm"
-          export STRIP="$TC/llvm-strip"
-          export OBJCOPY="$TC/llvm-objcopy"
-          export OBJDUMP="$TC/llvm-objdump"
-          export OBJSIZE="$TC/llvm-size"
-          export READELF="$TC/llvm-readelf"
-          export HOSTCC="$TC/clang"
-          export HOSTCXX="$TC/clang++"
-          export HOSTLD="$TC/ld.lld"
-          export HOSTAR="$TC/llvm-ar"
+          export CC="ccache clang"
+          export LD="ld.lld"
+          export AR="llvm-ar" NM="llvm-nm" STRIP="llvm-strip"
+          export OBJCOPY="llvm-objcopy" OBJDUMP="llvm-objdump"
+          export OBJSIZE="llvm-size" READELF="llvm-readelf"
+          export HOSTCC="clang" HOSTCXX="clang++"
+          export CCACHE_COMPILERCHECK=content
+          export CCACHE_CPP2=yes
+          export CCACHE_SLOPPINESS=time_macros,locale,file_macro
+          ccache -M 5G
+          ccache -z
 
-          echo "======================================"
-          echo " Sashimi Kernel Build"
-          echo " Architecture: $ARCH"
-          echo " Defconfig: $KERNEL_DEFCONFIG"
-          echo " LLVM: $LLVM_VERSION"
-          echo "======================================"
-
+          echo "=== Sashimi | Proton Clang | -O2 ==="
           make O=out ARCH="$ARCH" "$KERNEL_DEFCONFIG"
-          if [ ! -s out/.config ]; then echo "ERROR: .config not generated!"; exit 1; fi
+          test -s out/.config || { echo "ERROR: .config not generated"; exit 1; }
+          grep -E '^CONFIG_KSU=y$|^CONFIG_KSU_MANUAL_HOOK=y$' out/.config || echo "WARNING: KSU not enabled"
 
-          if grep -q '^CONFIG_KSU=y$' out/.config && grep -q '^CONFIG_KSU_MANUAL_HOOK=y$' out/.config; then
-            echo "KernelSU is enabled."
-          else
-            echo "WARNING: KernelSU or Manual Hook is not enabled."
-          fi
-
-          make -j"$(nproc)" \
-            O=out ARCH="$ARCH" \
+          make -j"$(nproc)" O=out ARCH="$ARCH" \
             CC="$CC" LD="$LD" AR="$AR" NM="$NM" STRIP="$STRIP" \
             OBJCOPY="$OBJCOPY" OBJDUMP="$OBJDUMP" OBJSIZE="$OBJSIZE" READELF="$READELF" \
-            HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" HOSTLD="$HOSTLD" HOSTAR="$HOSTAR" \
+            HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" \
             CLANG_TRIPLE="$CLANG_TRIPLE" \
             CROSS_COMPILE="$CROSS_COMPILE" CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             KCFLAGS="-fcommon -Wno-unknown-warning-option -Wno-error=implicit-function-declaration -Wno-error=implicit-int -Wno-error=int-conversion -Wno-error=incompatible-function-pointer-types" \
-            2>&1 | tee build.log
+            Image.gz-dtb 2>&1 | tee build.log
+
+          ccache -s
 
       - name: Verify Output
         run: |
           set -euo pipefail
           BOOT_DIR="out/arch/${KERNEL_ARCH}/boot"
-          if [ -d "$BOOT_DIR" ]; then
-            find "$BOOT_DIR" -maxdepth 3 -type f -printf '%p (%s bytes)\n'
-          else
-            echo "ERROR: Boot directory does not exist!"; exit 1
-          fi
           if [ -s "$BOOT_DIR/Image.gz-dtb" ]; then KERNEL_IMAGE="Image.gz-dtb"
           elif [ -s "$BOOT_DIR/Image.gz" ]; then KERNEL_IMAGE="Image.gz"
           elif [ -s "$BOOT_DIR/Image" ]; then KERNEL_IMAGE="Image"
-          else
-            echo "ERROR: Kernel image not found!"
-            ls -lh out/vmlinux || true
-            tail -n 100 build.log || true
-            exit 1
-          fi
+          else echo "ERROR: no kernel image"; tail -n 100 build.log; exit 1; fi
           echo "KERNEL_IMAGE=$KERNEL_IMAGE" >> "$GITHUB_ENV"
 
-      - name: Package AnyKernel3 Flashable ZIP
+      - name: Package AnyKernel3
         id: package
         run: |
           set -euo pipefail
@@ -165,7 +115,6 @@ jobs:
           cd anykernel
           rm -f zImage Image Image.gz Image.gz-dtb
           cp "../out/arch/${KERNEL_ARCH}/boot/${KERNEL_IMAGE}" "$KERNEL_IMAGE"
-          if [ ! -s "$KERNEL_IMAGE" ]; then echo "ERROR: image copy failed!"; exit 1; fi
           cat > anykernel.sh << 'EOF'
           properties() { '
           kernel.string=Sashimi Kernel
@@ -191,7 +140,6 @@ jobs:
           rm -rf .git README.md .github *placeholder*
           ZIP_NAME="Sashimi-Kernel-blossom-$(date -u +%y%m%d-%H%M).zip"
           zip -r9 "../$ZIP_NAME" .
-          if [ ! -s "../$ZIP_NAME" ]; then echo "ERROR: ZIP not created!"; exit 1; fi
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload Flashable ZIP
@@ -202,7 +150,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Raw Kernel Files
+      - name: Upload Raw Files
         uses: actions/upload-artifact@v4
         with:
           name: raw-kernel-files
