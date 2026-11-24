@@ -1,0 +1,99 @@
+name: Reintegrate BakaSU (latest)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Последний тег BakaSU. Хочешь bleeding edge — замени на main.
+  BAKASU_REF: v4.2.0-rc3
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout sashimi+
+        uses: actions/checkout@v4
+        with:
+          ref: sashimi+            # ветка должна существовать в origin (запушь её сначала)
+          fetch-depth: 0
+
+      - name: Remove previous integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-files --stage KernelSU | grep -q '^160000 '; then
+            git rm -f -- KernelSU
+          fi
+          rm -rf KernelSU
+          rm -f drivers/kernelsu
+          sed -i '\|^obj-$(CONFIG_KSU) += kernelsu/$|d' drivers/Makefile
+          sed -i '\|^source "drivers/kernelsu/Kconfig"$|d' drivers/Kconfig
+
+      - name: Clone BakaSU and wire it
+        shell: bash
+        run: |
+          set -euo pipefail
+          # setup.sh форка клонирует ReSukiSU — поэтому клонируем BakaSU сами.
+          git clone --depth 1 --branch "$BAKASU_REF" \
+            https://github.com/Baka-SU/BakaSU.git KernelSU
+          rm -rf KernelSU/.git                 # иначе git запишет сабмодуль
+          test -f KernelSU/kernel/Kconfig
+
+          ln -s ../KernelSU/kernel drivers/kernelsu
+
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile \
+            || printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig \
+            || sed -i '$i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          test -L drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          grep -Fq 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile
+          grep -Fq 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+      - name: Configure BakaSU (manual hooks)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("arch/arm64/configs/blossom_defconfig")
+          lines = [l for l in p.read_text().splitlines()
+                   if not (l.startswith("CONFIG_KSU") or l.startswith("# CONFIG_KSU"))]
+          lines += [
+              "",
+              "# BakaSU (manual hooks)",
+              "CONFIG_KSU=y",
+              "CONFIG_KSU_MANUAL_HOOK=y",
+              "# CONFIG_KSU_MANUAL_HOOK_AUTO_SETUID_HOOK is not set",
+              "# CONFIG_KSU_MANUAL_HOOK_AUTO_INITRC_HOOK is not set",
+              "# CONFIG_KSU_MANUAL_HOOK_AUTO_INPUT_HOOK is not set",
+          ]
+          p.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898280+github-actions[bot]@users.noreply.github.com"
+
+          git add -A KernelSU drivers/Makefile drivers/Kconfig drivers/kernelsu \
+            arch/arm64/configs/blossom_defconfig
+
+          if git ls-files --stage KernelSU | grep -q '^160000 '; then
+            echo "ERROR: KernelSU is still a gitlink!"
+            exit 1
+          fi
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Integrate BakaSU ${BAKASU_REF} sources"
+            git push origin HEAD:sashimi+
+          else
+            echo "No changes to commit"
+          fi
