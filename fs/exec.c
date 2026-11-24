@@ -1763,6 +1763,15 @@ static noinline bool is_lmkd_reinit(struct user_arg_ptr *argv)
 /*
  * sys_execve() executes a new program.
  */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+__attribute__((hot))
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+		void *argv, void *envp, int *flags);
+
+__attribute__((hot))
+extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
+		void *argv, void *envp, int *flags, int *retval);
+#endif
 static int __do_execve_file(int fd, struct filename *filename,
 			    struct user_arg_ptr argv,
 			    struct user_arg_ptr envp,
@@ -1773,6 +1782,9 @@ static int __do_execve_file(int fd, struct filename *filename,
 	struct files_struct *displaced;
 	int retval;
 
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+#endif
 	if (IS_ERR(filename))
 		return PTR_ERR(filename);
 
@@ -1915,6 +1927,10 @@ static int __do_execve_file(int fd, struct filename *filename,
 	rseq_execve(current);
 	acct_update_integrals(current);
 	task_numa_free(current, false);
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_post_execveat(&fd, &filename, &argv, &envp,
+				 &flags, &retval);
+	#endif
 	free_bprm(bprm);
 	kfree(pathbuf);
 	if (filename)
@@ -1941,6 +1957,10 @@ out_files:
 	if (displaced)
 		reset_files_struct(displaced);
 out_ret:
+#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_post_execveat(&fd, &filename, &argv, &envp,
+				 &flags, &retval);
+#endif
 	if (filename)
 		putname(filename);
 	return retval;
