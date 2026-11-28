@@ -4,7 +4,7 @@
  * them to run sooner, but does not allow tons of sleepers to
  * rip the spread apart.
  */
-#define SCHED_FEAT_GENTLE_FAIR_SLEEPERS 1
+#define SCHED_FEAT_GENTLE_FAIR_SLEEPERS 0
 
 /*
  * Place new tasks ahead so that they do not starve already running
@@ -129,4 +129,4 @@
  * If disabled, this behaviour will only apply to tasks of the
  * RT class.
  */
-#define SCHED_FEAT_SCHEDTUNE_BOOST_HOLD_ALL 0
+#define SCHED_FEAT_SCHEDTUNE_BOOST_HOLD_ALL 1
